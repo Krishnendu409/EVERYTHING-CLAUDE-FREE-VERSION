@@ -1,0 +1,5580 @@
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use tokio::process::Command;
+
+use super::output::SessionOutputStore;
+use super::runtime::capture_command_output;
+use super::store::StateStore;
+use super::{
+    default_project_label, default_task_group_label, normalize_group_label, Session,
+    SessionAgentProfile, SessionGrouping, SessionMetrics, SessionState,
+};
+use crate::comms::{self, MessageType};
+use crate::config::Config;
+use crate::observability::{log_tool_call, ToolCallEvent, ToolLogEntry, ToolLogPage, ToolLogger};
+use crate::worktree;
+
+pub async fn create_session(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+) -> Result<String> {
+    create_session_with_profile_and_grouping(
+        db,
+        cfg,
+        task,
+        agent_type,
+        use_worktree,
+        None,
+        SessionGrouping::default(),
+    )
+    .await
+}
+
+pub async fn create_session_with_grouping(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    grouping: SessionGrouping,
+) -> Result<String> {
+    create_session_with_profile_and_grouping(
+        db,
+        cfg,
+        task,
+        agent_type,
+        use_worktree,
+        None,
+        grouping,
+    )
+    .await
+}
+
+pub async fn create_session_with_profile_and_grouping(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    profile_name: Option<&str>,
+    grouping: SessionGrouping,
+) -> Result<String> {
+    let repo_root =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    queue_session_in_dir(
+        db,
+        cfg,
+        task,
+        agent_type,
+        use_worktree,
+        &repo_root,
+        profile_name,
+        None,
+        grouping,
+    )
+    .await
+}
+
+pub async fn create_session_from_source_with_profile_and_grouping(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    profile_name: Option<&str>,
+    source_session_id: &str,
+    grouping: SessionGrouping,
+) -> Result<String> {
+    let repo_root =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    queue_session_in_dir(
+        db,
+        cfg,
+        task,
+        agent_type,
+        use_worktree,
+        &repo_root,
+        profile_name,
+        Some(source_session_id),
+        grouping,
+    )
+    .await
+}
+
+pub fn list_sessions(db: &StateStore) -> Result<Vec<Session>> {
+    db.list_sessions()
+}
+
+pub fn get_status(db: &StateStore, id: &str) -> Result<SessionStatus> {
+    let session = resolve_session(db, id)?;
+    let session_id = session.id.clone();
+    Ok(SessionStatus {
+        profile: db.get_session_profile(&session_id)?,
+        session,
+        parent_session: db.latest_task_handoff_source(&session_id)?,
+        delegated_children: db.delegated_children(&session_id, 5)?,
+    })
+}
+
+pub fn get_team_status(db: &StateStore, id: &str, depth: usize) -> Result<TeamStatus> {
+    let root = resolve_session(db, id)?;
+    let handoff_backlog = db
+        .unread_task_handoff_targets(db.list_sessions()?.len().max(1))?
+        .into_iter()
+        .collect();
+    let mut visited = HashSet::new();
+    visited.insert(root.id.clone());
+
+    let mut descendants = Vec::new();
+    collect_delegation_descendants(
+        db,
+        &root.id,
+        depth,
+        1,
+        &handoff_backlog,
+        &mut visited,
+        &mut descendants,
+    )?;
+
+    Ok(TeamStatus {
+        root,
+        handoff_backlog,
+        descendants,
+    })
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HeartbeatEnforcementOutcome {
+    pub stale_sessions: Vec<String>,
+    pub auto_terminated_sessions: Vec<String>,
+}
+
+pub fn enforce_session_heartbeats(
+    db: &StateStore,
+    cfg: &Config,
+) -> Result<HeartbeatEnforcementOutcome> {
+    enforce_session_heartbeats_with(db, cfg, kill_process)
+}
+
+fn enforce_session_heartbeats_with<F>(
+    db: &StateStore,
+    cfg: &Config,
+    terminate_pid: F,
+) -> Result<HeartbeatEnforcementOutcome>
+where
+    F: Fn(u32) -> Result<()>,
+{
+    let timeout = chrono::Duration::seconds(cfg.session_timeout_secs as i64);
+    let now = chrono::Utc::now();
+    let mut outcome = HeartbeatEnforcementOutcome::default();
+
+    for session in db.list_sessions()? {
+        if !matches!(session.state, SessionState::Running | SessionState::Stale) {
+            continue;
+        }
+
+        if now.signed_duration_since(session.last_heartbeat_at) <= timeout {
+            continue;
+        }
+
+        if cfg.auto_terminate_stale_sessions {
+            if let Some(pid) = session.pid {
+                let _ = terminate_pid(pid);
+            }
+            db.update_state_and_pid(&session.id, &SessionState::Failed, None)?;
+            outcome.auto_terminated_sessions.push(session.id);
+            continue;
+        }
+
+        if session.state != SessionState::Stale {
+            db.update_state(&session.id, &SessionState::Stale)?;
+            outcome.stale_sessions.push(session.id);
+        }
+    }
+
+    Ok(outcome)
+}
+
+pub async fn assign_session(
+    db: &StateStore,
+    cfg: &Config,
+    lead_id: &str,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+) -> Result<AssignmentOutcome> {
+    assign_session_with_profile_and_grouping(
+        db,
+        cfg,
+        lead_id,
+        task,
+        agent_type,
+        use_worktree,
+        None,
+        SessionGrouping::default(),
+    )
+    .await
+}
+
+pub async fn assign_session_with_grouping(
+    db: &StateStore,
+    cfg: &Config,
+    lead_id: &str,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    grouping: SessionGrouping,
+) -> Result<AssignmentOutcome> {
+    assign_session_with_profile_and_grouping(
+        db,
+        cfg,
+        lead_id,
+        task,
+        agent_type,
+        use_worktree,
+        None,
+        grouping,
+    )
+    .await
+}
+
+pub async fn assign_session_with_profile_and_grouping(
+    db: &StateStore,
+    cfg: &Config,
+    lead_id: &str,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    profile_name: Option<&str>,
+    grouping: SessionGrouping,
+) -> Result<AssignmentOutcome> {
+    let repo_root =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    assign_session_in_dir_with_runner_program(
+        db,
+        cfg,
+        lead_id,
+        task,
+        agent_type,
+        use_worktree,
+        &repo_root,
+        &std::env::current_exe().context("Failed to resolve ECC executable path")?,
+        profile_name,
+        grouping,
+    )
+    .await
+}
+
+pub async fn drain_inbox(
+    db: &StateStore,
+    cfg: &Config,
+    lead_id: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    limit: usize,
+) -> Result<Vec<InboxDrainOutcome>> {
+    let repo_root =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    let runner_program =
+        std::env::current_exe().context("Failed to resolve ECC executable path")?;
+    let lead = resolve_session(db, lead_id)?;
+    let messages = db.unread_task_handoffs_for_session(&lead.id, limit)?;
+    let mut outcomes = Vec::new();
+
+    for message in messages {
+        let task = match comms::parse(&message.content) {
+            Some(MessageType::TaskHandoff { task, .. }) => task,
+            _ => extract_legacy_handoff_task(&message.content)
+                .unwrap_or_else(|| message.content.clone()),
+        };
+
+        let outcome = assign_session_in_dir_with_runner_program(
+            db,
+            cfg,
+            &lead.id,
+            &task,
+            agent_type,
+            use_worktree,
+            &repo_root,
+            &runner_program,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        if assignment_action_routes_work(outcome.action) {
+            let _ = db.mark_message_read(message.id)?;
+        }
+        outcomes.push(InboxDrainOutcome {
+            message_id: message.id,
+            task,
+            session_id: outcome.session_id,
+            action: outcome.action,
+        });
+    }
+
+    Ok(outcomes)
+}
+
+pub async fn auto_dispatch_backlog(
+    db: &StateStore,
+    cfg: &Config,
+    agent_type: &str,
+    use_worktree: bool,
+    lead_limit: usize,
+) -> Result<Vec<LeadDispatchOutcome>> {
+    let targets = db.unread_task_handoff_targets(lead_limit)?;
+    let mut outcomes = Vec::new();
+
+    for (lead_id, unread_count) in targets {
+        let routed = drain_inbox(
+            db,
+            cfg,
+            &lead_id,
+            agent_type,
+            use_worktree,
+            cfg.auto_dispatch_limit_per_session,
+        )
+        .await?;
+
+        if !routed.is_empty() {
+            outcomes.push(LeadDispatchOutcome {
+                lead_session_id: lead_id,
+                unread_count,
+                routed,
+            });
+        }
+    }
+
+    Ok(outcomes)
+}
+
+pub async fn rebalance_all_teams(
+    db: &StateStore,
+    cfg: &Config,
+    agent_type: &str,
+    use_worktree: bool,
+    lead_limit: usize,
+) -> Result<Vec<LeadRebalanceOutcome>> {
+    let sessions = db.list_sessions()?;
+    let mut outcomes = Vec::new();
+
+    for session in sessions
+        .into_iter()
+        .filter(|session| {
+            matches!(
+                session.state,
+                SessionState::Running | SessionState::Pending | SessionState::Idle
+            )
+        })
+        .take(lead_limit)
+    {
+        let rerouted = rebalance_team_backlog(
+            db,
+            cfg,
+            &session.id,
+            agent_type,
+            use_worktree,
+            cfg.auto_dispatch_limit_per_session,
+        )
+        .await?;
+
+        if !rerouted.is_empty() {
+            outcomes.push(LeadRebalanceOutcome {
+                lead_session_id: session.id,
+                rerouted,
+            });
+        }
+    }
+
+    Ok(outcomes)
+}
+
+pub async fn coordinate_backlog(
+    db: &StateStore,
+    cfg: &Config,
+    agent_type: &str,
+    use_worktree: bool,
+    lead_limit: usize,
+) -> Result<CoordinateBacklogOutcome> {
+    let dispatched = auto_dispatch_backlog(db, cfg, agent_type, use_worktree, lead_limit).await?;
+    let rebalanced = rebalance_all_teams(db, cfg, agent_type, use_worktree, lead_limit).await?;
+    let remaining_targets = db.unread_task_handoff_targets(db.list_sessions()?.len().max(1))?;
+    let pressure = summarize_backlog_pressure(db, cfg, agent_type, &remaining_targets)?;
+    let remaining_backlog_sessions = remaining_targets.len();
+    let remaining_backlog_messages = remaining_targets
+        .iter()
+        .map(|(_, unread_count)| *unread_count)
+        .sum();
+
+    Ok(CoordinateBacklogOutcome {
+        dispatched,
+        rebalanced,
+        remaining_backlog_sessions,
+        remaining_backlog_messages,
+        remaining_absorbable_sessions: pressure.absorbable_sessions,
+        remaining_saturated_sessions: pressure.saturated_sessions,
+    })
+}
+
+pub async fn rebalance_team_backlog(
+    db: &StateStore,
+    cfg: &Config,
+    lead_id: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    limit: usize,
+) -> Result<Vec<RebalanceOutcome>> {
+    let repo_root =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    let runner_program =
+        std::env::current_exe().context("Failed to resolve ECC executable path")?;
+    let lead = resolve_session(db, lead_id)?;
+    let mut outcomes = Vec::new();
+
+    if limit == 0 {
+        return Ok(outcomes);
+    }
+
+    let delegates = direct_delegate_sessions(db, &lead.id, agent_type)?;
+    let unread_counts = db.unread_message_counts()?;
+    let team_has_capacity = delegates.len() < cfg.max_parallel_sessions;
+
+    for delegate in &delegates {
+        if outcomes.len() >= limit {
+            break;
+        }
+
+        let unread_count = unread_counts.get(&delegate.id).copied().unwrap_or(0);
+        if unread_count <= 1 {
+            continue;
+        }
+
+        let has_clear_idle_elsewhere = delegates.iter().any(|candidate| {
+            candidate.id != delegate.id
+                && candidate.state == SessionState::Idle
+                && unread_counts.get(&candidate.id).copied().unwrap_or(0) == 0
+        });
+
+        if !has_clear_idle_elsewhere && !team_has_capacity {
+            continue;
+        }
+
+        let message_budget = limit.saturating_sub(outcomes.len());
+        let messages = db.unread_task_handoffs_for_session(&delegate.id, message_budget)?;
+
+        for message in messages {
+            if outcomes.len() >= limit {
+                break;
+            }
+
+            let current_delegates = direct_delegate_sessions(db, &lead.id, agent_type)?;
+            let current_unread_counts = db.unread_message_counts()?;
+            let current_team_has_capacity = current_delegates.len() < cfg.max_parallel_sessions;
+            let current_has_clear_idle_elsewhere = current_delegates.iter().any(|candidate| {
+                candidate.id != delegate.id
+                    && candidate.state == SessionState::Idle
+                    && current_unread_counts
+                        .get(&candidate.id)
+                        .copied()
+                        .unwrap_or(0)
+                        == 0
+            });
+
+            if !current_has_clear_idle_elsewhere && !current_team_has_capacity {
+                break;
+            }
+
+            if message.from_session != lead.id {
+                continue;
+            }
+
+            let task = match comms::parse(&message.content) {
+                Some(MessageType::TaskHandoff { task, .. }) => task,
+                _ => extract_legacy_handoff_task(&message.content)
+                    .unwrap_or_else(|| message.content.clone()),
+            };
+
+            let outcome = assign_session_in_dir_with_runner_program(
+                db,
+                cfg,
+                &lead.id,
+                &task,
+                agent_type,
+                use_worktree,
+                &repo_root,
+                &runner_program,
+                None,
+                SessionGrouping::default(),
+            )
+            .await?;
+
+            if outcome.session_id == delegate.id {
+                continue;
+            }
+
+            let _ = db.mark_message_read(message.id)?;
+            outcomes.push(RebalanceOutcome {
+                from_session_id: delegate.id.clone(),
+                message_id: message.id,
+                task,
+                session_id: outcome.session_id,
+                action: outcome.action,
+            });
+        }
+    }
+
+    Ok(outcomes)
+}
+
+pub async fn stop_session(db: &StateStore, id: &str) -> Result<()> {
+    stop_session_with_options(db, id, true).await
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct BudgetEnforcementOutcome {
+    pub token_budget_exceeded: bool,
+    pub cost_budget_exceeded: bool,
+    pub profile_token_budget_exceeded: bool,
+    pub paused_sessions: Vec<String>,
+}
+
+impl BudgetEnforcementOutcome {
+    pub fn hard_limit_exceeded(&self) -> bool {
+        self.token_budget_exceeded
+            || self.cost_budget_exceeded
+            || self.profile_token_budget_exceeded
+    }
+}
+
+pub fn enforce_budget_hard_limits(
+    db: &StateStore,
+    cfg: &Config,
+) -> Result<BudgetEnforcementOutcome> {
+    let sessions = db.list_sessions()?;
+    let total_tokens = sessions
+        .iter()
+        .map(|session| session.metrics.tokens_used)
+        .sum::<u64>();
+    let total_cost = sessions
+        .iter()
+        .map(|session| session.metrics.cost_usd)
+        .sum::<f64>();
+
+    let mut outcome = BudgetEnforcementOutcome {
+        token_budget_exceeded: cfg.token_budget > 0 && total_tokens >= cfg.token_budget,
+        cost_budget_exceeded: cfg.cost_budget_usd > 0.0 && total_cost >= cfg.cost_budget_usd,
+        profile_token_budget_exceeded: false,
+        paused_sessions: Vec::new(),
+    };
+
+    let mut sessions_to_pause = HashSet::new();
+
+    if outcome.token_budget_exceeded || outcome.cost_budget_exceeded {
+        for session in sessions.iter().filter(|session| {
+            matches!(
+                session.state,
+                SessionState::Pending | SessionState::Running | SessionState::Idle
+            )
+        }) {
+            sessions_to_pause.insert(session.id.clone());
+        }
+    }
+
+    for session in sessions.iter().filter(|session| {
+        matches!(
+            session.state,
+            SessionState::Pending | SessionState::Running | SessionState::Idle
+        )
+    }) {
+        let Some(profile) = db.get_session_profile(&session.id)? else {
+            continue;
+        };
+        let Some(token_budget) = profile.token_budget else {
+            continue;
+        };
+        if token_budget > 0 && session.metrics.tokens_used >= token_budget {
+            outcome.profile_token_budget_exceeded = true;
+            sessions_to_pause.insert(session.id.clone());
+        }
+    }
+
+    if !outcome.hard_limit_exceeded() {
+        return Ok(outcome);
+    }
+
+    for session in sessions.into_iter().filter(|session| {
+        sessions_to_pause.contains(&session.id)
+            && matches!(
+                session.state,
+                SessionState::Pending | SessionState::Running | SessionState::Idle
+            )
+    }) {
+        stop_session_recorded(db, &session, false)?;
+        outcome.paused_sessions.push(session.id);
+    }
+
+    Ok(outcome)
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ConflictEnforcementOutcome {
+    pub strategy: crate::config::ConflictResolutionStrategy,
+    pub created_incidents: usize,
+    pub resolved_incidents: usize,
+    pub paused_sessions: Vec<String>,
+}
+
+pub fn enforce_conflict_resolution(
+    db: &StateStore,
+    cfg: &Config,
+) -> Result<ConflictEnforcementOutcome> {
+    let mut outcome = ConflictEnforcementOutcome {
+        strategy: cfg.conflict_resolution.strategy,
+        created_incidents: 0,
+        resolved_incidents: 0,
+        paused_sessions: Vec::new(),
+    };
+
+    if !cfg.conflict_resolution.enabled {
+        return Ok(outcome);
+    }
+
+    let sessions = db.list_sessions()?;
+    let sessions_by_id: HashMap<_, _> = sessions
+        .iter()
+        .cloned()
+        .map(|session| (session.id.clone(), session))
+        .collect();
+
+    let active_sessions: Vec<_> = sessions
+        .into_iter()
+        .filter(|session| {
+            matches!(
+                session.state,
+                SessionState::Pending
+                    | SessionState::Running
+                    | SessionState::Idle
+                    | SessionState::Stale
+            )
+        })
+        .collect();
+
+    let mut latest_activity_by_path: BTreeMap<String, Vec<super::FileActivityEntry>> =
+        BTreeMap::new();
+    for session in &active_sessions {
+        let mut seen_paths = HashSet::new();
+        for entry in db.list_file_activity(&session.id, 64)? {
+            if seen_paths.insert(entry.path.clone()) {
+                latest_activity_by_path
+                    .entry(entry.path.clone())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+    }
+
+    let mut paused_once = HashSet::new();
+
+    for (path, mut entries) in latest_activity_by_path {
+        entries.retain(|entry| !matches!(entry.action, super::FileActivityAction::Read));
+        if entries.len() < 2 {
+            continue;
+        }
+
+        entries.sort_by_key(|entry| (entry.timestamp, entry.session_id.clone()));
+        let latest = entries.last().cloned().expect("entries is not empty");
+        for other in entries[..entries.len() - 1].iter() {
+            let conflict_key = conflict_incident_key(&path, &latest.session_id, &other.session_id);
+            if db.has_open_conflict_incident(&conflict_key)? {
+                continue;
+            }
+
+            let (active_session_id, paused_session_id, summary) =
+                choose_conflict_resolution(&path, &latest, other, cfg.conflict_resolution.strategy);
+            let (first_session_id, second_session_id, first_action, second_action) =
+                if latest.session_id <= other.session_id {
+                    (
+                        latest.session_id.clone(),
+                        other.session_id.clone(),
+                        latest.action.clone(),
+                        other.action.clone(),
+                    )
+                } else {
+                    (
+                        other.session_id.clone(),
+                        latest.session_id.clone(),
+                        other.action.clone(),
+                        latest.action.clone(),
+                    )
+                };
+
+            db.upsert_conflict_incident(
+                &conflict_key,
+                &path,
+                &first_session_id,
+                &second_session_id,
+                &active_session_id,
+                &paused_session_id,
+                &first_action,
+                &second_action,
+                conflict_strategy_label(cfg.conflict_resolution.strategy),
+                &summary,
+            )?;
+
+            if paused_once.insert(paused_session_id.clone()) {
+                if let Some(session) = sessions_by_id.get(&paused_session_id) {
+                    if matches!(
+                        session.state,
+                        SessionState::Pending
+                            | SessionState::Running
+                            | SessionState::Idle
+                            | SessionState::Stale
+                    ) {
+                        stop_session_recorded(db, session, false)?;
+                        outcome.paused_sessions.push(paused_session_id.clone());
+                    }
+                }
+            }
+
+            comms::send(
+                db,
+                &active_session_id,
+                &paused_session_id,
+                &MessageType::Conflict {
+                    file: path.clone(),
+                    description: summary.clone(),
+                },
+            )?;
+
+            db.insert_decision(
+                &paused_session_id,
+                &format!("Pause work due to conflict on {path}"),
+                &[
+                    format!("Keep {active_session_id} active"),
+                    "Continue concurrently".to_string(),
+                ],
+                &summary,
+            )?;
+
+            if cfg.conflict_resolution.notify_lead {
+                if let Some(lead_session_id) = db.latest_task_handoff_source(&paused_session_id)? {
+                    if lead_session_id != paused_session_id && lead_session_id != active_session_id
+                    {
+                        comms::send(
+                            db,
+                            &paused_session_id,
+                            &lead_session_id,
+                            &MessageType::Conflict {
+                                file: path.clone(),
+                                description: format!(
+                                    "{} | delegate {} paused",
+                                    summary, paused_session_id
+                                ),
+                            },
+                        )?;
+                    }
+                }
+            }
+
+            outcome.created_incidents += 1;
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn conflict_incident_key(path: &str, session_a: &str, session_b: &str) -> String {
+    let (first, second) = if session_a <= session_b {
+        (session_a, session_b)
+    } else {
+        (session_b, session_a)
+    };
+    format!("{path}::{first}::{second}")
+}
+
+fn conflict_strategy_label(strategy: crate::config::ConflictResolutionStrategy) -> &'static str {
+    match strategy {
+        crate::config::ConflictResolutionStrategy::Escalate => "escalate",
+        crate::config::ConflictResolutionStrategy::LastWriteWins => "last_write_wins",
+        crate::config::ConflictResolutionStrategy::Merge => "merge",
+    }
+}
+
+fn choose_conflict_resolution(
+    path: &str,
+    latest: &super::FileActivityEntry,
+    other: &super::FileActivityEntry,
+    strategy: crate::config::ConflictResolutionStrategy,
+) -> (String, String, String) {
+    match strategy {
+        crate::config::ConflictResolutionStrategy::Escalate => (
+            other.session_id.clone(),
+            latest.session_id.clone(),
+            format!(
+                "Escalated overlap on {path}; paused later session {} while {} stays active",
+                latest.session_id, other.session_id
+            ),
+        ),
+        crate::config::ConflictResolutionStrategy::LastWriteWins => (
+            latest.session_id.clone(),
+            other.session_id.clone(),
+            format!(
+                "Applied last-write-wins on {path}; kept later session {} active and paused {}",
+                latest.session_id, other.session_id
+            ),
+        ),
+        crate::config::ConflictResolutionStrategy::Merge => (
+            other.session_id.clone(),
+            latest.session_id.clone(),
+            format!(
+                "Queued manual merge on {path}; paused later session {} until merge review against {}",
+                latest.session_id, other.session_id
+            ),
+        ),
+    }
+}
+
+pub fn record_tool_call(
+    db: &StateStore,
+    session_id: &str,
+    tool_name: &str,
+    input_summary: &str,
+    output_summary: &str,
+    duration_ms: u64,
+) -> Result<ToolLogEntry> {
+    let session = db
+        .get_session(session_id)?
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+
+    let event = ToolCallEvent::new(
+        session.id.clone(),
+        tool_name,
+        input_summary,
+        output_summary,
+        duration_ms,
+    );
+    let entry = log_tool_call(db, &event)?;
+    db.increment_tool_calls(&session.id)?;
+
+    Ok(entry)
+}
+
+pub fn query_tool_calls(
+    db: &StateStore,
+    session_id: &str,
+    page: u64,
+    page_size: u64,
+) -> Result<ToolLogPage> {
+    let session = db
+        .get_session(session_id)?
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+
+    ToolLogger::new(db).query(&session.id, page, page_size)
+}
+
+pub async fn resume_session(db: &StateStore, cfg: &Config, id: &str) -> Result<String> {
+    resume_session_with_program(db, cfg, id, None).await
+}
+
+async fn resume_session_with_program(
+    db: &StateStore,
+    _cfg: &Config,
+    id: &str,
+    runner_executable_override: Option<&Path>,
+) -> Result<String> {
+    let session = resolve_session(db, id)?;
+
+    if session.state == SessionState::Completed {
+        anyhow::bail!("Completed sessions cannot be resumed: {}", session.id);
+    }
+
+    if session.state == SessionState::Running {
+        anyhow::bail!("Session is already running: {}", session.id);
+    }
+
+    db.update_state_and_pid(&session.id, &SessionState::Pending, None)?;
+    if let Some(worktree) = session.worktree.as_ref() {
+        if let Err(error) = worktree::sync_shared_dependency_dirs(worktree) {
+            tracing::warn!(
+                "Shared dependency cache sync warning for resumed session {}: {error}",
+                session.id
+            );
+        }
+    }
+    let runner_executable = match runner_executable_override {
+        Some(program) => program.to_path_buf(),
+        None => std::env::current_exe().context("Failed to resolve ECC executable path")?,
+    };
+    spawn_session_runner_for_program(
+        &session.task,
+        &session.id,
+        &session.agent_type,
+        &session.working_dir,
+        &runner_executable,
+    )
+    .await
+    .with_context(|| format!("Failed to resume session {}", session.id))?;
+    Ok(session.id)
+}
+
+async fn assign_session_in_dir_with_runner_program(
+    db: &StateStore,
+    cfg: &Config,
+    lead_id: &str,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    repo_root: &Path,
+    runner_program: &Path,
+    profile_name: Option<&str>,
+    grouping: SessionGrouping,
+) -> Result<AssignmentOutcome> {
+    let lead = resolve_session(db, lead_id)?;
+    let inherited_grouping = SessionGrouping {
+        project: grouping
+            .project
+            .or_else(|| normalize_group_label(&lead.project)),
+        task_group: grouping
+            .task_group
+            .or_else(|| normalize_group_label(&lead.task_group)),
+    };
+    let delegates = direct_delegate_sessions(db, &lead.id, agent_type)?;
+    let delegate_handoff_backlog = delegates
+        .iter()
+        .map(|session| {
+            db.unread_task_handoff_count(&session.id)
+                .map(|count| (session.id.clone(), count))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>>>()?;
+
+    if let Some(idle_delegate) = delegates
+        .iter()
+        .filter(|session| {
+            session.state == SessionState::Idle
+                && delegate_handoff_backlog
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+        })
+        .min_by_key(|session| session.updated_at)
+    {
+        send_task_handoff(db, &lead, &idle_delegate.id, task, "reused idle delegate")?;
+        return Ok(AssignmentOutcome {
+            session_id: idle_delegate.id.clone(),
+            action: AssignmentAction::ReusedIdle,
+        });
+    }
+
+    if delegates.len() < cfg.max_parallel_sessions {
+        let session_id = queue_session_in_dir_with_runner_program(
+            db,
+            cfg,
+            task,
+            agent_type,
+            use_worktree,
+            repo_root,
+            runner_program,
+            profile_name,
+            Some(&lead.id),
+            inherited_grouping.clone(),
+        )
+        .await?;
+        send_task_handoff(db, &lead, &session_id, task, "spawned new delegate")?;
+        return Ok(AssignmentOutcome {
+            session_id,
+            action: AssignmentAction::Spawned,
+        });
+    }
+
+    if let Some(_idle_delegate) = delegates
+        .iter()
+        .filter(|session| session.state == SessionState::Idle)
+        .min_by_key(|session| {
+            (
+                delegate_handoff_backlog
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(0),
+                session.updated_at,
+            )
+        })
+    {
+        return Ok(AssignmentOutcome {
+            session_id: lead.id.clone(),
+            action: AssignmentAction::DeferredSaturated,
+        });
+    }
+
+    if let Some(active_delegate) = delegates
+        .iter()
+        .filter(|session| matches!(session.state, SessionState::Running | SessionState::Pending))
+        .min_by_key(|session| {
+            (
+                delegate_handoff_backlog
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(0),
+                session.updated_at,
+            )
+        })
+    {
+        if delegate_handoff_backlog
+            .get(&active_delegate.id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            return Ok(AssignmentOutcome {
+                session_id: lead.id.clone(),
+                action: AssignmentAction::DeferredSaturated,
+            });
+        }
+
+        send_task_handoff(
+            db,
+            &lead,
+            &active_delegate.id,
+            task,
+            "reused active delegate at capacity",
+        )?;
+        return Ok(AssignmentOutcome {
+            session_id: active_delegate.id.clone(),
+            action: AssignmentAction::ReusedActive,
+        });
+    }
+
+    let session_id = queue_session_in_dir_with_runner_program(
+        db,
+        cfg,
+        task,
+        agent_type,
+        use_worktree,
+        repo_root,
+        runner_program,
+        profile_name,
+        Some(&lead.id),
+        inherited_grouping,
+    )
+    .await?;
+    send_task_handoff(db, &lead, &session_id, task, "spawned fallback delegate")?;
+    Ok(AssignmentOutcome {
+        session_id,
+        action: AssignmentAction::Spawned,
+    })
+}
+
+fn collect_delegation_descendants(
+    db: &StateStore,
+    session_id: &str,
+    remaining_depth: usize,
+    current_depth: usize,
+    handoff_backlog: &std::collections::HashMap<String, usize>,
+    visited: &mut HashSet<String>,
+    descendants: &mut Vec<DelegatedSessionSummary>,
+) -> Result<()> {
+    if remaining_depth == 0 {
+        return Ok(());
+    }
+
+    for child_id in db.delegated_children(session_id, 50)? {
+        if !visited.insert(child_id.clone()) {
+            continue;
+        }
+
+        let Some(session) = db.get_session(&child_id)? else {
+            continue;
+        };
+
+        descendants.push(DelegatedSessionSummary {
+            depth: current_depth,
+            handoff_backlog: handoff_backlog.get(&child_id).copied().unwrap_or(0),
+            session,
+        });
+
+        collect_delegation_descendants(
+            db,
+            &child_id,
+            remaining_depth.saturating_sub(1),
+            current_depth + 1,
+            handoff_backlog,
+            visited,
+            descendants,
+        )?;
+    }
+
+    Ok(())
+}
+
+pub async fn cleanup_session_worktree(db: &StateStore, id: &str) -> Result<()> {
+    let session = resolve_session(db, id)?;
+
+    if session.state == SessionState::Running {
+        stop_session_with_options(db, &session.id, true).await?;
+        db.clear_worktree(&session.id)?;
+        return Ok(());
+    }
+
+    if let Some(worktree) = session.worktree.as_ref() {
+        crate::worktree::remove(worktree)?;
+        db.clear_worktree(&session.id)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeMergeOutcome {
+    pub session_id: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub already_up_to_date: bool,
+    pub cleaned_worktree: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeRebaseOutcome {
+    pub session_id: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub already_up_to_date: bool,
+}
+
+pub async fn merge_session_worktree(
+    db: &StateStore,
+    id: &str,
+    cleanup_worktree: bool,
+) -> Result<WorktreeMergeOutcome> {
+    let session = resolve_session(db, id)?;
+
+    if matches!(
+        session.state,
+        SessionState::Pending | SessionState::Running | SessionState::Idle | SessionState::Stale
+    ) {
+        anyhow::bail!(
+            "Cannot merge active session {} while it is {}",
+            session.id,
+            session.state
+        );
+    }
+
+    let worktree = session
+        .worktree
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Session {} has no attached worktree", session.id))?;
+    let outcome = crate::worktree::merge_into_base(&worktree)?;
+
+    if cleanup_worktree {
+        crate::worktree::remove(&worktree)?;
+        db.clear_worktree(&session.id)?;
+    }
+
+    Ok(WorktreeMergeOutcome {
+        session_id: session.id,
+        branch: outcome.branch,
+        base_branch: outcome.base_branch,
+        already_up_to_date: outcome.already_up_to_date,
+        cleaned_worktree: cleanup_worktree,
+    })
+}
+
+pub async fn rebase_session_worktree(db: &StateStore, id: &str) -> Result<WorktreeRebaseOutcome> {
+    let session = resolve_session(db, id)?;
+
+    if matches!(
+        session.state,
+        SessionState::Pending | SessionState::Running | SessionState::Idle | SessionState::Stale
+    ) {
+        anyhow::bail!(
+            "Cannot rebase active session {} while it is {}",
+            session.id,
+            session.state
+        );
+    }
+
+    let worktree = session
+        .worktree
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Session {} has no attached worktree", session.id))?;
+    let outcome = crate::worktree::rebase_onto_base(&worktree)?;
+
+    Ok(WorktreeRebaseOutcome {
+        session_id: session.id,
+        branch: outcome.branch,
+        base_branch: outcome.base_branch,
+        already_up_to_date: outcome.already_up_to_date,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeMergeFailure {
+    pub session_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeBulkMergeOutcome {
+    pub merged: Vec<WorktreeMergeOutcome>,
+    pub rebased: Vec<WorktreeRebaseOutcome>,
+    pub active_with_worktree_ids: Vec<String>,
+    pub conflicted_session_ids: Vec<String>,
+    pub dirty_worktree_ids: Vec<String>,
+    pub blocked_by_queue_session_ids: Vec<String>,
+    pub failures: Vec<WorktreeMergeFailure>,
+}
+
+pub async fn merge_ready_worktrees(
+    db: &StateStore,
+    cleanup_worktree: bool,
+) -> Result<WorktreeBulkMergeOutcome> {
+    if cleanup_worktree {
+        return process_merge_queue(db).await;
+    }
+
+    merge_ready_worktrees_one_pass(db, cleanup_worktree).await
+}
+
+pub async fn process_merge_queue(db: &StateStore) -> Result<WorktreeBulkMergeOutcome> {
+    let mut merged = Vec::new();
+    let mut rebased = Vec::new();
+    let mut failures = Vec::new();
+    let mut attempted_rebase_heads = BTreeMap::<String, String>::new();
+
+    loop {
+        let report = build_merge_queue(db)?;
+        let mut merged_any = false;
+
+        for entry in &report.ready_entries {
+            match merge_session_worktree(db, &entry.session_id, true).await {
+                Ok(outcome) => {
+                    merged.push(outcome);
+                    merged_any = true;
+                }
+                Err(error) => failures.push(WorktreeMergeFailure {
+                    session_id: entry.session_id.clone(),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        if merged_any {
+            continue;
+        }
+
+        let mut rebased_any = false;
+        for entry in &report.blocked_entries {
+            if !can_auto_rebase_merge_queue_entry(entry) {
+                continue;
+            }
+
+            let session = resolve_session(db, &entry.session_id)?;
+            let Some(worktree) = session.worktree.clone() else {
+                continue;
+            };
+            let base_head = crate::worktree::branch_head_oid(&worktree, &worktree.base_branch)?;
+            if attempted_rebase_heads
+                .get(&entry.session_id)
+                .is_some_and(|last_head| last_head == &base_head)
+            {
+                continue;
+            }
+            attempted_rebase_heads.insert(entry.session_id.clone(), base_head);
+
+            match rebase_session_worktree(db, &entry.session_id).await {
+                Ok(outcome) => {
+                    rebased.push(outcome);
+                    rebased_any = true;
+                    break;
+                }
+                Err(error) => failures.push(WorktreeMergeFailure {
+                    session_id: entry.session_id.clone(),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        if rebased_any {
+            continue;
+        }
+
+        let (
+            active_with_worktree_ids,
+            conflicted_session_ids,
+            dirty_worktree_ids,
+            blocked_by_queue_session_ids,
+        ) = classify_merge_queue_report(&report);
+
+        return Ok(WorktreeBulkMergeOutcome {
+            merged,
+            rebased,
+            active_with_worktree_ids,
+            conflicted_session_ids,
+            dirty_worktree_ids,
+            blocked_by_queue_session_ids,
+            failures,
+        });
+    }
+}
+
+async fn merge_ready_worktrees_one_pass(
+    db: &StateStore,
+    cleanup_worktree: bool,
+) -> Result<WorktreeBulkMergeOutcome> {
+    let sessions = db.list_sessions()?;
+    let mut merged = Vec::new();
+    let mut active_with_worktree_ids = Vec::new();
+    let mut conflicted_session_ids = Vec::new();
+    let mut dirty_worktree_ids = Vec::new();
+    let mut failures = Vec::new();
+
+    for session in sessions {
+        let Some(worktree) = session.worktree.clone() else {
+            continue;
+        };
+
+        if matches!(
+            session.state,
+            SessionState::Pending
+                | SessionState::Running
+                | SessionState::Idle
+                | SessionState::Stale
+        ) {
+            active_with_worktree_ids.push(session.id);
+            continue;
+        }
+
+        match crate::worktree::merge_readiness(&worktree) {
+            Ok(readiness)
+                if readiness.status == crate::worktree::MergeReadinessStatus::Conflicted =>
+            {
+                conflicted_session_ids.push(session.id);
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failures.push(WorktreeMergeFailure {
+                    session_id: session.id,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        }
+
+        match crate::worktree::has_uncommitted_changes(&worktree) {
+            Ok(true) => {
+                dirty_worktree_ids.push(session.id);
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                failures.push(WorktreeMergeFailure {
+                    session_id: session.id,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        }
+
+        match merge_session_worktree(db, &session.id, cleanup_worktree).await {
+            Ok(outcome) => merged.push(outcome),
+            Err(error) => failures.push(WorktreeMergeFailure {
+                session_id: session.id,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    Ok(WorktreeBulkMergeOutcome {
+        merged,
+        rebased: Vec::new(),
+        active_with_worktree_ids,
+        conflicted_session_ids,
+        dirty_worktree_ids,
+        blocked_by_queue_session_ids: Vec::new(),
+        failures,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreePruneOutcome {
+    pub cleaned_session_ids: Vec<String>,
+    pub active_with_worktree_ids: Vec<String>,
+    pub retained_session_ids: Vec<String>,
+}
+
+pub async fn prune_inactive_worktrees(
+    db: &StateStore,
+    cfg: &Config,
+) -> Result<WorktreePruneOutcome> {
+    let sessions = db.list_sessions()?;
+    let mut cleaned_session_ids = Vec::new();
+    let mut active_with_worktree_ids = Vec::new();
+    let mut retained_session_ids = Vec::new();
+    let retention = chrono::Duration::seconds(cfg.worktree_retention_secs as i64);
+    let now = chrono::Utc::now();
+
+    for session in sessions {
+        let Some(_) = session.worktree.as_ref() else {
+            continue;
+        };
+
+        if matches!(
+            session.state,
+            SessionState::Pending | SessionState::Running | SessionState::Idle
+        ) {
+            active_with_worktree_ids.push(session.id);
+            continue;
+        }
+
+        if retention > chrono::Duration::zero()
+            && now.signed_duration_since(session.last_heartbeat_at) < retention
+        {
+            retained_session_ids.push(session.id);
+            continue;
+        }
+
+        cleanup_session_worktree(db, &session.id).await?;
+        cleaned_session_ids.push(session.id);
+    }
+
+    Ok(WorktreePruneOutcome {
+        cleaned_session_ids,
+        active_with_worktree_ids,
+        retained_session_ids,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeQueueBlocker {
+    pub session_id: String,
+    pub branch: String,
+    pub state: SessionState,
+    pub conflicts: Vec<String>,
+    pub summary: String,
+    pub conflicting_patch_preview: Option<String>,
+    pub blocker_patch_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeQueueEntry {
+    pub session_id: String,
+    pub task: String,
+    pub project: String,
+    pub task_group: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub state: SessionState,
+    pub worktree_health: worktree::WorktreeHealth,
+    pub dirty: bool,
+    pub queue_position: Option<usize>,
+    pub ready_to_merge: bool,
+    pub blocked_by: Vec<MergeQueueBlocker>,
+    pub suggested_action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeQueueReport {
+    pub ready_entries: Vec<MergeQueueEntry>,
+    pub blocked_entries: Vec<MergeQueueEntry>,
+}
+
+pub fn build_merge_queue(db: &StateStore) -> Result<MergeQueueReport> {
+    let mut sessions = db
+        .list_sessions()?
+        .into_iter()
+        .filter(|session| session.worktree.is_some())
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        merge_queue_priority(left)
+            .cmp(&merge_queue_priority(right))
+            .then_with(|| left.project.cmp(&right.project))
+            .then_with(|| left.task_group.cmp(&right.task_group))
+            .then_with(|| left.updated_at.cmp(&right.updated_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut entries = Vec::new();
+    let mut mergeable_sessions = Vec::<Session>::new();
+    let mut next_position = 1usize;
+
+    for session in sessions {
+        let Some(worktree) = session.worktree.clone() else {
+            continue;
+        };
+
+        let worktree_health = worktree::health(&worktree)?;
+        let dirty = worktree::has_uncommitted_changes(&worktree)?;
+        let mut blocked_by = Vec::new();
+
+        if matches!(
+            session.state,
+            SessionState::Pending
+                | SessionState::Running
+                | SessionState::Idle
+                | SessionState::Stale
+        ) {
+            blocked_by.push(MergeQueueBlocker {
+                session_id: session.id.clone(),
+                branch: worktree.branch.clone(),
+                state: session.state.clone(),
+                conflicts: Vec::new(),
+                summary: format!("session is still {}", session_state_label(&session.state)),
+                conflicting_patch_preview: None,
+                blocker_patch_preview: None,
+            });
+        } else if worktree_health == worktree::WorktreeHealth::Conflicted {
+            let readiness = worktree::merge_readiness(&worktree)?;
+            blocked_by.push(MergeQueueBlocker {
+                session_id: session.id.clone(),
+                branch: worktree.branch.clone(),
+                state: session.state.clone(),
+                conflicts: readiness.conflicts,
+                summary: readiness.summary,
+                conflicting_patch_preview: worktree::diff_patch_preview(&worktree, 18)?,
+                blocker_patch_preview: None,
+            });
+        } else if dirty {
+            blocked_by.push(MergeQueueBlocker {
+                session_id: session.id.clone(),
+                branch: worktree.branch.clone(),
+                state: session.state.clone(),
+                conflicts: Vec::new(),
+                summary: "worktree has uncommitted changes".to_string(),
+                conflicting_patch_preview: worktree::diff_patch_preview(&worktree, 18)?,
+                blocker_patch_preview: None,
+            });
+        } else {
+            for blocker in &mergeable_sessions {
+                let Some(blocker_worktree) = blocker.worktree.as_ref() else {
+                    continue;
+                };
+                let Some(conflict) =
+                    worktree::branch_conflict_preview(&worktree, blocker_worktree, 12)?
+                else {
+                    continue;
+                };
+
+                blocked_by.push(MergeQueueBlocker {
+                    session_id: blocker.id.clone(),
+                    branch: blocker_worktree.branch.clone(),
+                    state: blocker.state.clone(),
+                    conflicts: conflict.conflicts,
+                    summary: format!("merge after {} to avoid branch conflicts", blocker.id),
+                    conflicting_patch_preview: conflict.right_patch_preview,
+                    blocker_patch_preview: conflict.left_patch_preview,
+                });
+            }
+        }
+
+        let ready_to_merge = blocked_by.is_empty();
+        let queue_position = if ready_to_merge {
+            let position = next_position;
+            next_position += 1;
+            mergeable_sessions.push(session.clone());
+            Some(position)
+        } else {
+            None
+        };
+
+        let suggested_action = if let Some(position) = queue_position {
+            format!("merge in queue order #{position}")
+        } else if blocked_by
+            .iter()
+            .any(|blocker| blocker.session_id == session.id)
+        {
+            blocked_by
+                .first()
+                .map(|blocker| blocker.summary.clone())
+                .unwrap_or_else(|| "resolve merge blockers".to_string())
+        } else {
+            format!(
+                "merge after {}",
+                blocked_by
+                    .iter()
+                    .map(|blocker| blocker.session_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        entries.push(MergeQueueEntry {
+            session_id: session.id,
+            task: session.task,
+            project: session.project,
+            task_group: session.task_group,
+            branch: worktree.branch,
+            base_branch: worktree.base_branch,
+            state: session.state,
+            worktree_health,
+            dirty,
+            queue_position,
+            ready_to_merge,
+            blocked_by,
+            suggested_action,
+        });
+    }
+
+    let mut ready_entries = entries
+        .iter()
+        .filter(|entry| entry.ready_to_merge)
+        .cloned()
+        .collect::<Vec<_>>();
+    ready_entries.sort_by_key(|entry| entry.queue_position.unwrap_or(usize::MAX));
+
+    let blocked_entries = entries
+        .into_iter()
+        .filter(|entry| !entry.ready_to_merge)
+        .collect::<Vec<_>>();
+
+    Ok(MergeQueueReport {
+        ready_entries,
+        blocked_entries,
+    })
+}
+
+fn can_auto_rebase_merge_queue_entry(entry: &MergeQueueEntry) -> bool {
+    !entry.ready_to_merge
+        && !entry.dirty
+        && entry.worktree_health == worktree::WorktreeHealth::Conflicted
+        && !entry.blocked_by.is_empty()
+        && entry
+            .blocked_by
+            .iter()
+            .all(|blocker| blocker.session_id == entry.session_id)
+}
+
+fn classify_merge_queue_report(
+    report: &MergeQueueReport,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut active = Vec::new();
+    let mut conflicted = Vec::new();
+    let mut dirty = Vec::new();
+    let mut queue_blocked = Vec::new();
+
+    for entry in &report.blocked_entries {
+        if entry.blocked_by.iter().any(|blocker| {
+            blocker.session_id == entry.session_id
+                && matches!(
+                    blocker.state,
+                    SessionState::Pending
+                        | SessionState::Running
+                        | SessionState::Idle
+                        | SessionState::Stale
+                )
+        }) {
+            active.push(entry.session_id.clone());
+        } else if entry.dirty {
+            dirty.push(entry.session_id.clone());
+        } else if entry.worktree_health == worktree::WorktreeHealth::Conflicted {
+            conflicted.push(entry.session_id.clone());
+        } else {
+            queue_blocked.push(entry.session_id.clone());
+        }
+    }
+
+    (active, conflicted, dirty, queue_blocked)
+}
+
+pub async fn delete_session(db: &StateStore, id: &str) -> Result<()> {
+    let session = resolve_session(db, id)?;
+
+    if matches!(
+        session.state,
+        SessionState::Pending | SessionState::Running | SessionState::Idle
+    ) {
+        anyhow::bail!(
+            "Cannot delete active session {} while it is {}",
+            session.id,
+            session.state
+        );
+    }
+
+    if let Some(worktree) = session.worktree.as_ref() {
+        let _ = crate::worktree::remove(worktree);
+    }
+
+    db.delete_session(&session.id)?;
+    Ok(())
+}
+
+fn agent_program(agent_type: &str) -> Result<PathBuf> {
+    match agent_type {
+        "claude" => Ok(PathBuf::from("claude")),
+        other => anyhow::bail!("Unsupported agent type: {other}"),
+    }
+}
+
+fn resolve_session(db: &StateStore, id: &str) -> Result<Session> {
+    let session = if id == "latest" {
+        db.get_latest_session()?
+    } else {
+        db.get_session(id)?
+    };
+
+    session.ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))
+}
+
+pub async fn run_session(
+    cfg: &Config,
+    session_id: &str,
+    task: &str,
+    agent_type: &str,
+    working_dir: &Path,
+) -> Result<()> {
+    let db = StateStore::open(&cfg.db_path)?;
+    let session = resolve_session(&db, session_id)?;
+
+    if session.state != SessionState::Pending {
+        tracing::info!(
+            "Skipping run_session for {} because state is {}",
+            session_id,
+            session.state
+        );
+        return Ok(());
+    }
+
+    let agent_program = agent_program(agent_type)?;
+    let profile = db.get_session_profile(session_id)?;
+    let command = build_agent_command(&agent_program, task, session_id, working_dir, profile.as_ref());
+    capture_command_output(
+        cfg.db_path.clone(),
+        session_id.to_string(),
+        command,
+        SessionOutputStore::default(),
+        std::time::Duration::from_secs(cfg.heartbeat_interval_secs),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn activate_pending_worktree_sessions(
+    db: &StateStore,
+    cfg: &Config,
+) -> Result<Vec<String>> {
+    activate_pending_worktree_sessions_with(
+        db,
+        cfg,
+        |cfg, session_id, task, agent_type, cwd| async move {
+            tokio::spawn(async move {
+                if let Err(error) = run_session(&cfg, &session_id, &task, &agent_type, &cwd).await {
+                    tracing::error!(
+                        "Failed to start queued worktree session {}: {error}",
+                        session_id
+                    );
+                }
+            });
+            Ok(())
+        },
+    )
+    .await
+}
+
+async fn activate_pending_worktree_sessions_with<F, Fut>(
+    db: &StateStore,
+    cfg: &Config,
+    spawn: F,
+) -> Result<Vec<String>>
+where
+    F: Fn(Config, String, String, String, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut available_slots = cfg
+        .max_parallel_worktrees
+        .saturating_sub(attached_worktree_count(db)?);
+    if available_slots == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut started = Vec::new();
+    for request in db.pending_worktree_queue(available_slots)? {
+        let Some(session) = db.get_session(&request.session_id)? else {
+            db.dequeue_pending_worktree(&request.session_id)?;
+            continue;
+        };
+
+        if session.worktree.is_some()
+            || session.pid.is_some()
+            || session.state != SessionState::Pending
+        {
+            db.dequeue_pending_worktree(&session.id)?;
+            continue;
+        }
+
+        let worktree =
+            match worktree::create_for_session_in_repo(&session.id, cfg, &request.repo_root) {
+                Ok(worktree) => worktree,
+                Err(error) => {
+                    db.dequeue_pending_worktree(&session.id)?;
+                    db.update_state(&session.id, &SessionState::Failed)?;
+                    tracing::warn!(
+                        "Failed to create queued worktree for session {}: {error}",
+                        session.id
+                    );
+                    continue;
+                }
+            };
+
+        if let Err(error) = db.attach_worktree(&session.id, &worktree) {
+            let _ = worktree::remove(&worktree);
+            db.dequeue_pending_worktree(&session.id)?;
+            db.update_state(&session.id, &SessionState::Failed)?;
+            return Err(error.context(format!(
+                "Failed to attach queued worktree for session {}",
+                session.id
+            )));
+        }
+
+        if let Err(error) = spawn(
+            cfg.clone(),
+            session.id.clone(),
+            session.task.clone(),
+            session.agent_type.clone(),
+            worktree.path.clone(),
+        )
+        .await
+        {
+            let _ = worktree::remove(&worktree);
+            let _ = db.clear_worktree_to_dir(&session.id, &request.repo_root);
+            db.dequeue_pending_worktree(&session.id)?;
+            db.update_state(&session.id, &SessionState::Failed)?;
+            tracing::warn!(
+                "Failed to start queued worktree session {}: {error}",
+                session.id
+            );
+            continue;
+        }
+
+        db.dequeue_pending_worktree(&session.id)?;
+        started.push(session.id);
+        available_slots = available_slots.saturating_sub(1);
+        if available_slots == 0 {
+            break;
+        }
+    }
+
+    Ok(started)
+}
+
+async fn queue_session_in_dir(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    repo_root: &Path,
+    profile_name: Option<&str>,
+    inherited_profile_session_id: Option<&str>,
+    grouping: SessionGrouping,
+) -> Result<String> {
+    queue_session_in_dir_with_runner_program(
+        db,
+        cfg,
+        task,
+        agent_type,
+        use_worktree,
+        repo_root,
+        &std::env::current_exe().context("Failed to resolve ECC executable path")?,
+        profile_name,
+        inherited_profile_session_id,
+        grouping,
+    )
+    .await
+}
+
+async fn queue_session_in_dir_with_runner_program(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    repo_root: &Path,
+    runner_program: &Path,
+    profile_name: Option<&str>,
+    inherited_profile_session_id: Option<&str>,
+    grouping: SessionGrouping,
+) -> Result<String> {
+    let profile =
+        resolve_launch_profile(db, cfg, profile_name, inherited_profile_session_id)?;
+    let effective_agent_type = profile
+        .as_ref()
+        .and_then(|profile| profile.agent.as_deref())
+        .unwrap_or(agent_type);
+    let session = build_session_record(
+        db,
+        task,
+        effective_agent_type,
+        use_worktree,
+        cfg,
+        repo_root,
+        grouping,
+    )?;
+    db.insert_session(&session)?;
+    if let Some(profile) = profile.as_ref() {
+        db.upsert_session_profile(&session.id, profile)?;
+    }
+
+    if use_worktree && session.worktree.is_none() {
+        db.enqueue_pending_worktree(&session.id, repo_root)?;
+        return Ok(session.id);
+    }
+
+    let working_dir = session
+        .worktree
+        .as_ref()
+        .map(|worktree| worktree.path.as_path())
+        .unwrap_or(repo_root);
+
+    match spawn_session_runner_for_program(
+        task,
+        &session.id,
+        &session.agent_type,
+        working_dir,
+        runner_program,
+    )
+    .await
+    {
+        Ok(()) => Ok(session.id),
+        Err(error) => {
+            db.update_state(&session.id, &SessionState::Failed)?;
+
+            if let Some(worktree) = session.worktree.as_ref() {
+                let _ = crate::worktree::remove(worktree);
+            }
+
+            Err(error.context(format!("Failed to queue session {}", session.id)))
+        }
+    }
+}
+
+fn build_session_record(
+    db: &StateStore,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    cfg: &Config,
+    repo_root: &Path,
+    grouping: SessionGrouping,
+) -> Result<Session> {
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let now = chrono::Utc::now();
+
+    let worktree = if use_worktree && attached_worktree_count(db)? < cfg.max_parallel_worktrees {
+        Some(worktree::create_for_session_in_repo(&id, cfg, repo_root)?)
+    } else {
+        None
+    };
+    let working_dir = worktree
+        .as_ref()
+        .map(|worktree| worktree.path.clone())
+        .unwrap_or_else(|| repo_root.to_path_buf());
+    let project = grouping
+        .project
+        .as_deref()
+        .and_then(normalize_group_label)
+        .unwrap_or_else(|| default_project_label(repo_root));
+    let task_group = grouping
+        .task_group
+        .as_deref()
+        .and_then(normalize_group_label)
+        .unwrap_or_else(|| default_task_group_label(task));
+
+    Ok(Session {
+        id,
+        task: task.to_string(),
+        project,
+        task_group,
+        agent_type: agent_type.to_string(),
+        working_dir,
+        state: SessionState::Pending,
+        pid: None,
+        worktree,
+        created_at: now,
+        updated_at: now,
+        last_heartbeat_at: now,
+        metrics: SessionMetrics::default(),
+    })
+}
+
+async fn create_session_in_dir(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    repo_root: &Path,
+    agent_program: &Path,
+) -> Result<String> {
+    let session = build_session_record(
+        db,
+        task,
+        agent_type,
+        use_worktree,
+        cfg,
+        repo_root,
+        SessionGrouping::default(),
+    )?;
+
+    db.insert_session(&session)?;
+
+    if use_worktree && session.worktree.is_none() {
+        db.enqueue_pending_worktree(&session.id, repo_root)?;
+        return Ok(session.id);
+    }
+
+    let working_dir = session
+        .worktree
+        .as_ref()
+        .map(|worktree| worktree.path.as_path())
+        .unwrap_or(repo_root);
+
+    match spawn_claude_code(agent_program, task, &session.id, working_dir).await {
+        Ok(pid) => {
+            db.update_pid(&session.id, Some(pid))?;
+            db.update_state(&session.id, &SessionState::Running)?;
+            Ok(session.id)
+        }
+        Err(error) => {
+            db.update_state(&session.id, &SessionState::Failed)?;
+
+            if let Some(worktree) = session.worktree.as_ref() {
+                let _ = crate::worktree::remove(worktree);
+            }
+
+            Err(error.context(format!("Failed to start session {}", session.id)))
+        }
+    }
+}
+
+fn resolve_launch_profile(
+    db: &StateStore,
+    cfg: &Config,
+    explicit_profile_name: Option<&str>,
+    inherited_profile_session_id: Option<&str>,
+) -> Result<Option<SessionAgentProfile>> {
+    let inherited_profile_name = match inherited_profile_session_id {
+        Some(session_id) => db.get_session_profile(session_id)?.map(|profile| profile.profile_name),
+        None => None,
+    };
+    let profile_name = explicit_profile_name
+        .map(ToOwned::to_owned)
+        .or(inherited_profile_name)
+        .or_else(|| cfg.default_agent_profile.clone());
+
+    profile_name
+        .as_deref()
+        .map(|name| cfg.resolve_agent_profile(name))
+        .transpose()
+}
+
+fn attached_worktree_count(db: &StateStore) -> Result<usize> {
+    Ok(db
+        .list_sessions()?
+        .into_iter()
+        .filter(|session| session.worktree.is_some())
+        .count())
+}
+
+fn merge_queue_priority(session: &Session) -> (u8, chrono::DateTime<chrono::Utc>) {
+    let active_rank = match session.state {
+        SessionState::Completed | SessionState::Failed | SessionState::Stopped => 0,
+        SessionState::Pending
+        | SessionState::Running
+        | SessionState::Idle
+        | SessionState::Stale => 1,
+    };
+    (active_rank, session.updated_at)
+}
+
+async fn spawn_session_runner(
+    task: &str,
+    session_id: &str,
+    agent_type: &str,
+    working_dir: &Path,
+) -> Result<()> {
+    spawn_session_runner_for_program(
+        task,
+        session_id,
+        agent_type,
+        working_dir,
+        &std::env::current_exe().context("Failed to resolve ECC executable path")?,
+    )
+    .await
+}
+
+fn direct_delegate_sessions(
+    db: &StateStore,
+    lead_id: &str,
+    agent_type: &str,
+) -> Result<Vec<Session>> {
+    let mut sessions = Vec::new();
+    for child_id in db.delegated_children(lead_id, 50)? {
+        let Some(session) = db.get_session(&child_id)? else {
+            continue;
+        };
+
+        if session.agent_type != agent_type {
+            continue;
+        }
+
+        if matches!(
+            session.state,
+            SessionState::Pending | SessionState::Running | SessionState::Idle
+        ) {
+            sessions.push(session);
+        }
+    }
+
+    Ok(sessions)
+}
+
+fn summarize_backlog_pressure(
+    db: &StateStore,
+    cfg: &Config,
+    agent_type: &str,
+    targets: &[(String, usize)],
+) -> Result<BacklogPressureSummary> {
+    let mut summary = BacklogPressureSummary::default();
+
+    for (session_id, _) in targets {
+        let delegates = direct_delegate_sessions(db, session_id, agent_type)?;
+        let has_clear_idle_delegate = delegates.iter().any(|delegate| {
+            delegate.state == SessionState::Idle
+                && db.unread_task_handoff_count(&delegate.id).unwrap_or(0) == 0
+        });
+        let has_capacity = delegates.len() < cfg.max_parallel_sessions;
+
+        if has_clear_idle_delegate || has_capacity {
+            summary.absorbable_sessions += 1;
+        } else {
+            summary.saturated_sessions += 1;
+        }
+    }
+
+    Ok(summary)
+}
+
+fn send_task_handoff(
+    db: &StateStore,
+    from_session: &Session,
+    to_session_id: &str,
+    task: &str,
+    routing_reason: &str,
+) -> Result<()> {
+    let context = format!(
+        "Assigned by {} [{}] | cwd {}{} | {}",
+        from_session.id,
+        from_session.agent_type,
+        from_session.working_dir.display(),
+        from_session
+            .worktree
+            .as_ref()
+            .map(|worktree| format!(
+                " | worktree {} ({})",
+                worktree.branch,
+                worktree.path.display()
+            ))
+            .unwrap_or_default(),
+        routing_reason
+    );
+
+    crate::comms::send(
+        db,
+        &from_session.id,
+        to_session_id,
+        &crate::comms::MessageType::TaskHandoff {
+            task: task.to_string(),
+            context,
+        },
+    )
+}
+
+fn extract_legacy_handoff_task(content: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    value
+        .get("task")
+        .and_then(|task| task.as_str())
+        .map(ToOwned::to_owned)
+}
+
+async fn spawn_session_runner_for_program(
+    task: &str,
+    session_id: &str,
+    agent_type: &str,
+    working_dir: &Path,
+    current_exe: &Path,
+) -> Result<()> {
+    let child = Command::new(current_exe)
+        .arg("run-session")
+        .arg("--session-id")
+        .arg(session_id)
+        .arg("--task")
+        .arg(task)
+        .arg("--agent")
+        .arg(agent_type)
+        .arg("--cwd")
+        .arg(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to spawn ECC runner from {}", current_exe.display()))?;
+
+    child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("ECC runner did not expose a process id"))?;
+    Ok(())
+}
+
+fn build_agent_command(
+    agent_program: &Path,
+    task: &str,
+    session_id: &str,
+    working_dir: &Path,
+    profile: Option<&SessionAgentProfile>,
+) -> Command {
+    let mut command = Command::new(agent_program);
+    command.env("ECC_SESSION_ID", session_id);
+    command
+        .arg("--print")
+        .arg("--name")
+        .arg(format!("ecc-{session_id}"));
+    if let Some(profile) = profile {
+        if let Some(model) = profile.model.as_ref() {
+            command.arg("--model").arg(model);
+        }
+        if !profile.allowed_tools.is_empty() {
+            command
+                .arg("--allowed-tools")
+                .arg(profile.allowed_tools.join(","));
+        }
+        if !profile.disallowed_tools.is_empty() {
+            command
+                .arg("--disallowed-tools")
+                .arg(profile.disallowed_tools.join(","));
+        }
+        if let Some(permission_mode) = profile.permission_mode.as_ref() {
+            command.arg("--permission-mode").arg(permission_mode);
+        }
+        for dir in &profile.add_dirs {
+            command.arg("--add-dir").arg(dir);
+        }
+        if let Some(max_budget_usd) = profile.max_budget_usd {
+            command
+                .arg("--max-budget-usd")
+                .arg(max_budget_usd.to_string());
+        }
+        if let Some(prompt) = profile.append_system_prompt.as_ref() {
+            command.arg("--append-system-prompt").arg(prompt);
+        }
+    }
+    command.arg(task).current_dir(working_dir).stdin(Stdio::null());
+    command
+}
+
+async fn spawn_claude_code(
+    agent_program: &Path,
+    task: &str,
+    session_id: &str,
+    working_dir: &Path,
+) -> Result<u32> {
+    let mut command = build_agent_command(agent_program, task, session_id, working_dir, None);
+    let child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Failed to spawn Claude Code from {}",
+                agent_program.display()
+            )
+        })?;
+
+    child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("Claude Code did not expose a process id"))
+}
+
+async fn stop_session_with_options(
+    db: &StateStore,
+    id: &str,
+    cleanup_worktree: bool,
+) -> Result<()> {
+    let session = resolve_session(db, id)?;
+    stop_session_recorded(db, &session, cleanup_worktree)
+}
+
+fn stop_session_recorded(db: &StateStore, session: &Session, cleanup_worktree: bool) -> Result<()> {
+    if let Some(pid) = session.pid {
+        kill_process(pid)?;
+    }
+
+    db.update_pid(&session.id, None)?;
+    db.update_state(&session.id, &SessionState::Stopped)?;
+
+    if cleanup_worktree {
+        if let Some(worktree) = session.worktree.as_ref() {
+            crate::worktree::remove(worktree)?;
+            db.clear_worktree_to_dir(&session.id, &session.working_dir)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) -> Result<()> {
+    send_signal(pid, libc::SIGTERM)?;
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    send_signal(pid, libc::SIGKILL)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32) -> Result<()> {
+    let status = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .with_context(|| format!("Failed to invoke taskkill for process {pid}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("taskkill exited with status {status}"))
+    }
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: i32) -> Result<()> {
+    let outcome = unsafe { libc::kill(pid as i32, signal) };
+    if outcome == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+
+    Err(error).with_context(|| format!("Failed to kill process {pid}"))
+}
+
+#[cfg(not(unix))]
+async fn kill_process(pid: u32) -> Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("Failed to invoke taskkill for process {pid}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("taskkill failed for process {pid}");
+    }
+}
+
+pub struct SessionStatus {
+    profile: Option<SessionAgentProfile>,
+    session: Session,
+    parent_session: Option<String>,
+    delegated_children: Vec<String>,
+}
+
+pub struct TeamStatus {
+    root: Session,
+    handoff_backlog: std::collections::HashMap<String, usize>,
+    descendants: Vec<DelegatedSessionSummary>,
+}
+
+pub struct AssignmentOutcome {
+    pub session_id: String,
+    pub action: AssignmentAction,
+}
+
+pub struct InboxDrainOutcome {
+    pub message_id: i64,
+    pub task: String,
+    pub session_id: String,
+    pub action: AssignmentAction,
+}
+
+pub struct LeadDispatchOutcome {
+    pub lead_session_id: String,
+    pub unread_count: usize,
+    pub routed: Vec<InboxDrainOutcome>,
+}
+
+pub struct RebalanceOutcome {
+    pub from_session_id: String,
+    pub message_id: i64,
+    pub task: String,
+    pub session_id: String,
+    pub action: AssignmentAction,
+}
+
+pub struct LeadRebalanceOutcome {
+    pub lead_session_id: String,
+    pub rerouted: Vec<RebalanceOutcome>,
+}
+
+pub struct CoordinateBacklogOutcome {
+    pub dispatched: Vec<LeadDispatchOutcome>,
+    pub rebalanced: Vec<LeadRebalanceOutcome>,
+    pub remaining_backlog_sessions: usize,
+    pub remaining_backlog_messages: usize,
+    pub remaining_absorbable_sessions: usize,
+    pub remaining_saturated_sessions: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoordinationStatus {
+    pub backlog_leads: usize,
+    pub backlog_messages: usize,
+    pub absorbable_sessions: usize,
+    pub saturated_sessions: usize,
+    pub mode: CoordinationMode,
+    pub health: CoordinationHealth,
+    pub operator_escalation_required: bool,
+    pub auto_dispatch_enabled: bool,
+    pub auto_dispatch_limit_per_session: usize,
+    pub daemon_activity: super::store::DaemonActivity,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationMode {
+    DispatchFirst,
+    DispatchFirstStabilized,
+    RebalanceFirstChronicSaturation,
+    RebalanceCooloffChronicSaturation,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationHealth {
+    Healthy,
+    BacklogAbsorbable,
+    Saturated,
+    EscalationRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentAction {
+    Spawned,
+    ReusedIdle,
+    ReusedActive,
+    DeferredSaturated,
+}
+
+pub fn assignment_action_routes_work(action: AssignmentAction) -> bool {
+    !matches!(action, AssignmentAction::DeferredSaturated)
+}
+
+fn coordination_mode(activity: &super::store::DaemonActivity) -> CoordinationMode {
+    if activity.dispatch_cooloff_active() {
+        CoordinationMode::RebalanceCooloffChronicSaturation
+    } else if activity.prefers_rebalance_first() {
+        CoordinationMode::RebalanceFirstChronicSaturation
+    } else if activity.stabilized_after_recovery_at().is_some() {
+        CoordinationMode::DispatchFirstStabilized
+    } else {
+        CoordinationMode::DispatchFirst
+    }
+}
+
+fn coordination_health(
+    backlog_messages: usize,
+    saturated_sessions: usize,
+    activity: &super::store::DaemonActivity,
+) -> CoordinationHealth {
+    if activity.operator_escalation_required() {
+        CoordinationHealth::EscalationRequired
+    } else if saturated_sessions > 0 {
+        CoordinationHealth::Saturated
+    } else if backlog_messages > 0 {
+        CoordinationHealth::BacklogAbsorbable
+    } else {
+        CoordinationHealth::Healthy
+    }
+}
+
+pub fn get_coordination_status(db: &StateStore, cfg: &Config) -> Result<CoordinationStatus> {
+    let targets = db.unread_task_handoff_targets(db.list_sessions()?.len().max(1))?;
+    let pressure = summarize_backlog_pressure(db, cfg, &cfg.default_agent, &targets)?;
+    let backlog_messages = targets
+        .iter()
+        .map(|(_, unread_count)| *unread_count)
+        .sum::<usize>();
+    let daemon_activity = db.daemon_activity()?;
+
+    Ok(CoordinationStatus {
+        backlog_leads: targets.len(),
+        backlog_messages,
+        absorbable_sessions: pressure.absorbable_sessions,
+        saturated_sessions: pressure.saturated_sessions,
+        mode: coordination_mode(&daemon_activity),
+        health: coordination_health(
+            backlog_messages,
+            pressure.saturated_sessions,
+            &daemon_activity,
+        ),
+        operator_escalation_required: daemon_activity.operator_escalation_required(),
+        auto_dispatch_enabled: cfg.auto_dispatch_unread_handoffs,
+        auto_dispatch_limit_per_session: cfg.auto_dispatch_limit_per_session,
+        daemon_activity,
+    })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BacklogPressureSummary {
+    absorbable_sessions: usize,
+    saturated_sessions: usize,
+}
+
+struct DelegatedSessionSummary {
+    depth: usize,
+    handoff_backlog: usize,
+    session: Session,
+}
+
+impl fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = &self.session;
+        writeln!(f, "Session: {}", s.id)?;
+        writeln!(f, "Task:    {}", s.task)?;
+        writeln!(f, "Agent:   {}", s.agent_type)?;
+        writeln!(f, "State:   {}", s.state)?;
+        if let Some(profile) = self.profile.as_ref() {
+            writeln!(f, "Profile: {}", profile.profile_name)?;
+            if let Some(model) = profile.model.as_ref() {
+                writeln!(f, "Model:   {}", model)?;
+            }
+            if let Some(permission_mode) = profile.permission_mode.as_ref() {
+                writeln!(f, "Perms:   {}", permission_mode)?;
+            }
+            if let Some(token_budget) = profile.token_budget {
+                writeln!(f, "Profile tokens: {}", token_budget)?;
+            }
+            if let Some(max_budget_usd) = profile.max_budget_usd {
+                writeln!(f, "Profile cost: ${max_budget_usd:.4}")?;
+            }
+        }
+        if let Some(parent) = self.parent_session.as_ref() {
+            writeln!(f, "Parent:  {}", parent)?;
+        }
+        if let Some(pid) = s.pid {
+            writeln!(f, "PID:     {}", pid)?;
+        }
+        if let Some(ref wt) = s.worktree {
+            writeln!(f, "Branch:  {}", wt.branch)?;
+            writeln!(f, "Worktree: {}", wt.path.display())?;
+        }
+        writeln!(
+            f,
+            "Tokens:  {} total (in {} / out {})",
+            s.metrics.tokens_used, s.metrics.input_tokens, s.metrics.output_tokens
+        )?;
+        writeln!(f, "Tools:   {}", s.metrics.tool_calls)?;
+        writeln!(f, "Files:   {}", s.metrics.files_changed)?;
+        writeln!(f, "Cost:    ${:.4}", s.metrics.cost_usd)?;
+        writeln!(
+            f,
+            "Heartbeat: {} ({}s ago)",
+            s.last_heartbeat_at,
+            chrono::Utc::now()
+                .signed_duration_since(s.last_heartbeat_at)
+                .num_seconds()
+                .max(0)
+        )?;
+        if !self.delegated_children.is_empty() {
+            writeln!(f, "Children: {}", self.delegated_children.join(", "))?;
+        }
+        writeln!(f, "Created: {}", s.created_at)?;
+        write!(f, "Updated: {}", s.updated_at)
+    }
+}
+
+impl fmt::Display for TeamStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Lead:    {} [{}]", self.root.id, self.root.state)?;
+        writeln!(f, "Task:    {}", self.root.task)?;
+        writeln!(f, "Agent:   {}", self.root.agent_type)?;
+        if let Some(worktree) = self.root.worktree.as_ref() {
+            writeln!(f, "Branch:  {}", worktree.branch)?;
+        }
+
+        let lead_handoff_backlog = self
+            .handoff_backlog
+            .get(&self.root.id)
+            .copied()
+            .unwrap_or(0);
+        writeln!(f, "Backlog: {}", lead_handoff_backlog)?;
+
+        if self.descendants.is_empty() {
+            return write!(f, "Board:   no delegated sessions");
+        }
+
+        writeln!(f, "Board:")?;
+        let mut lanes: BTreeMap<&'static str, Vec<&DelegatedSessionSummary>> = BTreeMap::new();
+        for summary in &self.descendants {
+            lanes
+                .entry(session_state_label(&summary.session.state))
+                .or_default()
+                .push(summary);
+        }
+
+        for lane in [
+            "Running",
+            "Idle",
+            "Stale",
+            "Pending",
+            "Failed",
+            "Stopped",
+            "Completed",
+        ] {
+            let Some(items) = lanes.get(lane) else {
+                continue;
+            };
+
+            writeln!(f, "  {lane}:")?;
+            for item in items {
+                writeln!(
+                    f,
+                    "    - {}{} [{}] | backlog {} handoff(s) | {}",
+                    "  ".repeat(item.depth.saturating_sub(1)),
+                    item.session.id,
+                    item.session.agent_type,
+                    item.handoff_backlog,
+                    item.session.task
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for CoordinationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stabilized = self.daemon_activity.stabilized_after_recovery_at();
+        let mode = match self.mode {
+            CoordinationMode::DispatchFirst => "dispatch-first",
+            CoordinationMode::DispatchFirstStabilized => "dispatch-first (stabilized)",
+            CoordinationMode::RebalanceFirstChronicSaturation => {
+                "rebalance-first (chronic saturation)"
+            }
+            CoordinationMode::RebalanceCooloffChronicSaturation => {
+                "rebalance-cooloff (chronic saturation)"
+            }
+        };
+
+        writeln!(
+            f,
+            "Global handoff backlog: {} lead(s) / {} handoff(s) [{} absorbable, {} saturated]",
+            self.backlog_leads,
+            self.backlog_messages,
+            self.absorbable_sessions,
+            self.saturated_sessions
+        )?;
+        writeln!(
+            f,
+            "Auto-dispatch: {} @ {}/lead",
+            if self.auto_dispatch_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            self.auto_dispatch_limit_per_session
+        )?;
+        writeln!(f, "Coordination mode: {mode}")?;
+
+        if self.daemon_activity.chronic_saturation_streak > 0 {
+            writeln!(
+                f,
+                "Chronic saturation streak: {} cycle(s)",
+                self.daemon_activity.chronic_saturation_streak
+            )?;
+        }
+
+        if self.operator_escalation_required {
+            writeln!(f, "Operator escalation: chronic saturation is not clearing")?;
+        }
+
+        if let Some(cleared_at) = self.daemon_activity.chronic_saturation_cleared_at() {
+            writeln!(f, "Chronic saturation cleared: {}", cleared_at.to_rfc3339())?;
+        }
+
+        if let Some(stabilized_at) = stabilized {
+            writeln!(f, "Recovery stabilized: {}", stabilized_at.to_rfc3339())?;
+        }
+
+        if let Some(last_dispatch_at) = self.daemon_activity.last_dispatch_at.as_ref() {
+            writeln!(
+                f,
+                "Last daemon dispatch: {} routed / {} deferred across {} lead(s) @ {}",
+                self.daemon_activity.last_dispatch_routed,
+                self.daemon_activity.last_dispatch_deferred,
+                self.daemon_activity.last_dispatch_leads,
+                last_dispatch_at.to_rfc3339()
+            )?;
+        }
+
+        if stabilized.is_none() {
+            if let Some(last_recovery_dispatch_at) =
+                self.daemon_activity.last_recovery_dispatch_at.as_ref()
+            {
+                writeln!(
+                    f,
+                    "Last daemon recovery dispatch: {} handoff(s) across {} lead(s) @ {}",
+                    self.daemon_activity.last_recovery_dispatch_routed,
+                    self.daemon_activity.last_recovery_dispatch_leads,
+                    last_recovery_dispatch_at.to_rfc3339()
+                )?;
+            }
+
+            if let Some(last_rebalance_at) = self.daemon_activity.last_rebalance_at.as_ref() {
+                writeln!(
+                    f,
+                    "Last daemon rebalance: {} handoff(s) across {} lead(s) @ {}",
+                    self.daemon_activity.last_rebalance_rerouted,
+                    self.daemon_activity.last_rebalance_leads,
+                    last_rebalance_at.to_rfc3339()
+                )?;
+            }
+        }
+
+        if let Some(last_auto_merge_at) = self.daemon_activity.last_auto_merge_at.as_ref() {
+            writeln!(
+                f,
+                "Last daemon auto-merge: {} merged / {} active / {} conflicted / {} dirty / {} failed @ {}",
+                self.daemon_activity.last_auto_merge_merged,
+                self.daemon_activity.last_auto_merge_active_skipped,
+                self.daemon_activity.last_auto_merge_conflicted_skipped,
+                self.daemon_activity.last_auto_merge_dirty_skipped,
+                self.daemon_activity.last_auto_merge_failed,
+                last_auto_merge_at.to_rfc3339()
+            )?;
+        }
+
+        if let Some(last_auto_prune_at) = self.daemon_activity.last_auto_prune_at.as_ref() {
+            writeln!(
+                f,
+                "Last daemon auto-prune: {} pruned / {} active @ {}",
+                self.daemon_activity.last_auto_prune_pruned,
+                self.daemon_activity.last_auto_prune_active_skipped,
+                last_auto_prune_at.to_rfc3339()
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+fn session_state_label(state: &SessionState) -> &'static str {
+    match state {
+        SessionState::Pending => "Pending",
+        SessionState::Running => "Running",
+        SessionState::Idle => "Idle",
+        SessionState::Stale => "Stale",
+        SessionState::Completed => "Completed",
+        SessionState::Failed => "Failed",
+        SessionState::Stopped => "Stopped",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, PaneLayout, Theme};
+    use crate::session::{Session, SessionAgentProfile, SessionMetrics, SessionState};
+    use anyhow::{Context, Result};
+    use chrono::{Duration, Utc};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command as StdCommand;
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Result<Self> {
+            let path =
+                std::env::temp_dir().join(format!("ecc2-{}-{}", label, uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn build_config(root: &Path) -> Config {
+        Config {
+            db_path: root.join("state.db"),
+            worktree_root: root.join("worktrees"),
+            worktree_branch_prefix: "ecc".to_string(),
+            max_parallel_sessions: 4,
+            max_parallel_worktrees: 4,
+            worktree_retention_secs: 0,
+            session_timeout_secs: 60,
+            heartbeat_interval_secs: 5,
+            auto_terminate_stale_sessions: false,
+            default_agent: "claude".to_string(),
+            default_agent_profile: None,
+            agent_profiles: Default::default(),
+            auto_dispatch_unread_handoffs: false,
+            auto_dispatch_limit_per_session: 5,
+            auto_create_worktrees: true,
+            auto_merge_ready_worktrees: false,
+            desktop_notifications: crate::notifications::DesktopNotificationConfig::default(),
+            webhook_notifications: crate::notifications::WebhookNotificationConfig::default(),
+            completion_summary_notifications:
+                crate::notifications::CompletionSummaryConfig::default(),
+            cost_budget_usd: 10.0,
+            token_budget: 500_000,
+            budget_alert_thresholds: Config::BUDGET_ALERT_THRESHOLDS,
+            conflict_resolution: crate::config::ConflictResolutionConfig::default(),
+            theme: Theme::Dark,
+            pane_layout: PaneLayout::Horizontal,
+            pane_navigation: Default::default(),
+            linear_pane_size_percent: 35,
+            grid_pane_size_percent: 50,
+            risk_thresholds: Config::RISK_THRESHOLDS,
+        }
+    }
+
+    fn build_session(id: &str, state: SessionState, updated_at: chrono::DateTime<Utc>) -> Session {
+        Session {
+            id: id.to_string(),
+            task: format!("task-{id}"),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state,
+            pid: None,
+            worktree: None,
+            created_at: updated_at - Duration::minutes(1),
+            updated_at,
+            last_heartbeat_at: updated_at,
+            metrics: SessionMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn build_agent_command_applies_profile_runner_flags() {
+        let profile = SessionAgentProfile {
+            profile_name: "reviewer".to_string(),
+            agent: None,
+            model: Some("sonnet".to_string()),
+            allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
+            disallowed_tools: vec!["Bash".to_string()],
+            permission_mode: Some("plan".to_string()),
+            add_dirs: vec![PathBuf::from("docs"), PathBuf::from("specs")],
+            max_budget_usd: Some(1.25),
+            token_budget: Some(750),
+            append_system_prompt: Some("Review thoroughly.".to_string()),
+        };
+
+        let command = build_agent_command(
+            Path::new("claude"),
+            "review this change",
+            "sess-1234",
+            Path::new("/tmp/repo"),
+            Some(&profile),
+        );
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "--print",
+                "--name",
+                "ecc-sess-1234",
+                "--model",
+                "sonnet",
+                "--allowed-tools",
+                "Read,Edit",
+                "--disallowed-tools",
+                "Bash",
+                "--permission-mode",
+                "plan",
+                "--add-dir",
+                "docs",
+                "--add-dir",
+                "specs",
+                "--max-budget-usd",
+                "1.25",
+                "--append-system-prompt",
+                "Review thoroughly.",
+                "review this change",
+            ]
+        );
+    }
+
+    #[test]
+    fn enforce_session_heartbeats_marks_overdue_running_sessions_stale() -> Result<()> {
+        let tempdir = TestDir::new("manager-heartbeat-stale")?;
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "stale-1".to_string(),
+            task: "heartbeat overdue".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: Some(4242),
+            worktree: None,
+            created_at: now - Duration::minutes(5),
+            updated_at: now - Duration::minutes(5),
+            last_heartbeat_at: now - Duration::minutes(5),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let outcome = enforce_session_heartbeats(&db, &cfg)?;
+        let session = db.get_session("stale-1")?.expect("session should exist");
+
+        assert_eq!(outcome.stale_sessions, vec!["stale-1".to_string()]);
+        assert!(outcome.auto_terminated_sessions.is_empty());
+        assert_eq!(session.state, SessionState::Stale);
+        assert_eq!(session.pid, Some(4242));
+
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_session_heartbeats_auto_terminates_when_enabled() -> Result<()> {
+        let tempdir = TestDir::new("manager-heartbeat-terminate")?;
+        let mut cfg = build_config(tempdir.path());
+        cfg.auto_terminate_stale_sessions = true;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+        let killed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let killed_clone = killed.clone();
+
+        db.insert_session(&Session {
+            id: "stale-2".to_string(),
+            task: "terminate overdue".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: Some(7777),
+            worktree: None,
+            created_at: now - Duration::minutes(5),
+            updated_at: now - Duration::minutes(5),
+            last_heartbeat_at: now - Duration::minutes(5),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let outcome = enforce_session_heartbeats_with(&db, &cfg, move |pid| {
+            killed_clone.lock().unwrap().push(pid);
+            Ok(())
+        })?;
+        let session = db.get_session("stale-2")?.expect("session should exist");
+
+        assert!(outcome.stale_sessions.is_empty());
+        assert_eq!(
+            outcome.auto_terminated_sessions,
+            vec!["stale-2".to_string()]
+        );
+        assert_eq!(*killed.lock().unwrap(), vec![7777]);
+        assert_eq!(session.state, SessionState::Failed);
+        assert_eq!(session.pid, None);
+
+        Ok(())
+    }
+
+    fn build_daemon_activity() -> super::super::store::DaemonActivity {
+        let now = Utc::now();
+        super::super::store::DaemonActivity {
+            last_dispatch_at: Some(now),
+            last_dispatch_routed: 3,
+            last_dispatch_deferred: 1,
+            last_dispatch_leads: 2,
+            chronic_saturation_streak: 2,
+            last_recovery_dispatch_at: Some(now - Duration::seconds(5)),
+            last_recovery_dispatch_routed: 2,
+            last_recovery_dispatch_leads: 1,
+            last_rebalance_at: Some(now - Duration::seconds(2)),
+            last_rebalance_rerouted: 0,
+            last_rebalance_leads: 1,
+            last_auto_merge_at: Some(now - Duration::seconds(1)),
+            last_auto_merge_merged: 1,
+            last_auto_merge_active_skipped: 1,
+            last_auto_merge_conflicted_skipped: 0,
+            last_auto_merge_dirty_skipped: 0,
+            last_auto_merge_failed: 0,
+            last_auto_prune_at: Some(now),
+            last_auto_prune_pruned: 2,
+            last_auto_prune_active_skipped: 1,
+        }
+    }
+
+    fn init_git_repo(path: &Path) -> Result<()> {
+        fs::create_dir_all(path)?;
+        run_git(path, ["init", "-q"])?;
+        run_git(path, ["config", "user.name", "ECC Tests"])?;
+        run_git(path, ["config", "user.email", "ecc-tests@example.com"])?;
+        fs::write(path.join("README.md"), "hello\n")?;
+        run_git(path, ["add", "README.md"])?;
+        run_git(path, ["commit", "-qm", "init"])?;
+        Ok(())
+    }
+
+    fn run_git<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(path)
+            .status()
+            .with_context(|| format!("failed to run git in {}", path.display()))?;
+
+        if !status.success() {
+            anyhow::bail!("git command failed in {}", path.display());
+        }
+
+        Ok(())
+    }
+
+    fn write_fake_claude(root: &Path) -> Result<(PathBuf, PathBuf)> {
+        let script_path = root.join("fake-claude.sh");
+        let log_path = root.join("fake-claude.log");
+        let script = format!(
+            "#!/usr/bin/env python3\nimport os\nimport pathlib\nimport signal\nimport sys\nimport time\n\nlog_path = pathlib.Path(r\"{}\")\nlog_path.write_text(os.getcwd() + \"\\n\", encoding=\"utf-8\")\nwith log_path.open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\n    handle.write(\"ECC_SESSION_ID=\" + os.environ.get(\"ECC_SESSION_ID\", \"\") + \"\\n\")\n\ndef handle_term(signum, frame):\n    raise SystemExit(0)\n\nsignal.signal(signal.SIGTERM, handle_term)\nwhile True:\n    time.sleep(0.1)\n",
+            log_path.display()
+        );
+
+        fs::write(&script_path, script)?;
+        let mut permissions = fs::metadata(&script_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)?;
+
+        Ok((script_path, log_path))
+    }
+
+    fn wait_for_file(path: &Path) -> Result<String> {
+        for _ in 0..200 {
+            if path.exists() {
+                let content = fs::read_to_string(path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                if content.lines().count() >= 2 {
+                    return Ok(content);
+                }
+            }
+
+            thread::sleep(StdDuration::from_millis(20));
+        }
+
+        anyhow::bail!("timed out waiting for {}", path.display());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_spawns_process_and_marks_session_running() -> Result<()> {
+        let tempdir = TestDir::new("manager-create-session")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, log_path) = write_fake_claude(tempdir.path())?;
+
+        let session_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "implement lifecycle",
+            "claude",
+            false,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        let session = db
+            .get_session(&session_id)?
+            .context("session should exist")?;
+        assert_eq!(session.state, SessionState::Running);
+        assert!(
+            session.pid.is_some(),
+            "spawned session should persist a pid"
+        );
+
+        let log = wait_for_file(&log_path)?;
+        assert!(log.contains(repo_root.to_string_lossy().as_ref()));
+        assert!(log.contains("--print"));
+        assert!(log.contains("implement lifecycle"));
+        assert!(log.contains(&format!("ECC_SESSION_ID={session_id}")));
+
+        stop_session_with_options(&db, &session_id, false).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_derives_project_and_task_group_defaults() -> Result<()> {
+        let tempdir = TestDir::new("manager-create-session-grouping-defaults")?;
+        let repo_root = tempdir.path().join("checkout-api");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, _) = write_fake_claude(tempdir.path())?;
+
+        let session_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "stabilize auth callback",
+            "claude",
+            false,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        let session = db
+            .get_session(&session_id)?
+            .context("session should exist")?;
+        assert_eq!(session.project, "checkout-api");
+        assert_eq!(session.task_group, "stabilize auth callback");
+
+        stop_session_with_options(&db, &session_id, false).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_session_kills_process_and_optionally_cleans_worktree() -> Result<()> {
+        let tempdir = TestDir::new("manager-stop-session")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, _) = write_fake_claude(tempdir.path())?;
+
+        let keep_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "keep worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+        let keep_session = db.get_session(&keep_id)?.context("keep session missing")?;
+        keep_session.pid.context("keep session pid missing")?;
+        let keep_worktree = keep_session
+            .worktree
+            .clone()
+            .context("keep session worktree missing")?
+            .path;
+
+        stop_session_with_options(&db, &keep_id, false).await?;
+
+        let stopped_keep = db
+            .get_session(&keep_id)?
+            .context("stopped keep session missing")?;
+        assert_eq!(stopped_keep.state, SessionState::Stopped);
+        assert_eq!(stopped_keep.pid, None);
+        assert!(
+            keep_worktree.exists(),
+            "worktree should remain when cleanup is disabled"
+        );
+
+        let cleanup_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "cleanup worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+        let cleanup_session = db
+            .get_session(&cleanup_id)?
+            .context("cleanup session missing")?;
+        let cleanup_worktree = cleanup_session
+            .worktree
+            .clone()
+            .context("cleanup session worktree missing")?
+            .path;
+
+        stop_session_with_options(&db, &cleanup_id, true).await?;
+        assert!(
+            !cleanup_worktree.exists(),
+            "worktree should be removed when cleanup is enabled"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_with_worktree_limit_queues_without_starting_runner() -> Result<()> {
+        let tempdir = TestDir::new("manager-worktree-limit-queue")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.max_parallel_worktrees = 1;
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, log_path) = write_fake_claude(tempdir.path())?;
+
+        let first_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "active worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+        let second_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "queued worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        let first = db
+            .get_session(&first_id)?
+            .context("first session missing")?;
+        assert_eq!(first.state, SessionState::Running);
+        assert!(first.worktree.is_some());
+
+        let second = db
+            .get_session(&second_id)?
+            .context("second session missing")?;
+        assert_eq!(second.state, SessionState::Pending);
+        assert!(second.pid.is_none());
+        assert!(second.worktree.is_none());
+        assert!(db.pending_worktree_queue_contains(&second_id)?);
+
+        let log = wait_for_file(&log_path)?;
+        assert!(log.contains("active worktree"));
+        assert!(!log.contains("queued worktree"));
+
+        stop_session_with_options(&db, &first_id, true).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activate_pending_worktree_sessions_starts_queued_session_when_slot_opens() -> Result<()>
+    {
+        let tempdir = TestDir::new("manager-worktree-limit-activate")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.max_parallel_worktrees = 1;
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, _) = write_fake_claude(tempdir.path())?;
+
+        let first_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "active worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+        let second_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "queued worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        stop_session_with_options(&db, &first_id, true).await?;
+
+        let launch_log = tempdir.path().join("queued-launch.log");
+        let started =
+            activate_pending_worktree_sessions_with(&db, &cfg, |_, session_id, task, _, cwd| {
+                let launch_log = launch_log.clone();
+                async move {
+                    fs::write(
+                        &launch_log,
+                        format!("{session_id}\n{task}\n{}\n", cwd.display()),
+                    )?;
+                    Ok(())
+                }
+            })
+            .await?;
+
+        assert_eq!(started, vec![second_id.clone()]);
+        assert!(!db.pending_worktree_queue_contains(&second_id)?);
+
+        let second = db
+            .get_session(&second_id)?
+            .context("queued session missing")?;
+        let worktree = second
+            .worktree
+            .context("queued session should gain worktree")?;
+        assert_eq!(second.state, SessionState::Pending);
+        assert!(worktree.path.exists());
+
+        let launch = fs::read_to_string(&launch_log)?;
+        assert!(launch.contains(&second_id));
+        assert!(launch.contains("queued worktree"));
+        assert!(launch.contains(worktree.path.to_string_lossy().as_ref()));
+
+        crate::worktree::remove(&worktree)?;
+        db.clear_worktree_to_dir(&second_id, &repo_root)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_session_uses_default_agent_profile_and_persists_launch_settings() -> Result<()> {
+        let tempdir = TestDir::new("manager-default-agent-profile")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.default_agent_profile = Some("reviewer".to_string());
+        cfg.agent_profiles.insert(
+            "reviewer".to_string(),
+            crate::config::AgentProfileConfig {
+                model: Some("sonnet".to_string()),
+                allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
+                disallowed_tools: vec!["Bash".to_string()],
+                permission_mode: Some("plan".to_string()),
+                add_dirs: vec![PathBuf::from("docs")],
+                token_budget: Some(800),
+                append_system_prompt: Some("Review thoroughly.".to_string()),
+                ..Default::default()
+            },
+        );
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_runner, _) = write_fake_claude(tempdir.path())?;
+
+        let session_id = queue_session_in_dir_with_runner_program(
+            &db,
+            &cfg,
+            "review work",
+            "claude",
+            false,
+            &repo_root,
+            &fake_runner,
+            None,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        let profile = db
+            .get_session_profile(&session_id)?
+            .context("session profile should be persisted")?;
+        assert_eq!(profile.profile_name, "reviewer");
+        assert_eq!(profile.model.as_deref(), Some("sonnet"));
+        assert_eq!(profile.allowed_tools, vec!["Read", "Edit"]);
+        assert_eq!(profile.disallowed_tools, vec!["Bash"]);
+        assert_eq!(profile.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(profile.add_dirs, vec![PathBuf::from("docs")]);
+        assert_eq!(profile.token_budget, Some(800));
+        assert_eq!(
+            profile.append_system_prompt.as_deref(),
+            Some("Review thoroughly.")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_budget_hard_limits_stops_active_sessions_without_cleaning_worktrees() -> Result<()> {
+        let tempdir = TestDir::new("manager-budget-pause")?;
+        let mut cfg = build_config(tempdir.path());
+        cfg.token_budget = 100;
+        cfg.cost_budget_usd = 0.0;
+
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+        let worktree_path = tempdir.path().join("keep-worktree");
+        fs::create_dir_all(&worktree_path)?;
+
+        db.insert_session(&Session {
+            id: "active-over-budget".to_string(),
+            task: "pause on hard limit".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: tempdir.path().to_path_buf(),
+            state: SessionState::Running,
+            pid: Some(999_999),
+            worktree: Some(crate::session::WorktreeInfo {
+                path: worktree_path.clone(),
+                branch: "ecc/active-over-budget".to_string(),
+                base_branch: "main".to_string(),
+            }),
+            created_at: now - Duration::minutes(1),
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.update_metrics(
+            "active-over-budget",
+            &SessionMetrics {
+                input_tokens: 90,
+                output_tokens: 30,
+                tokens_used: 120,
+                tool_calls: 0,
+                files_changed: 0,
+                duration_secs: 60,
+                cost_usd: 0.0,
+            },
+        )?;
+
+        let outcome = enforce_budget_hard_limits(&db, &cfg)?;
+        assert!(outcome.token_budget_exceeded);
+        assert!(!outcome.cost_budget_exceeded);
+        assert_eq!(
+            outcome.paused_sessions,
+            vec!["active-over-budget".to_string()]
+        );
+
+        let session = db
+            .get_session("active-over-budget")?
+            .context("session should still exist")?;
+        assert_eq!(session.state, SessionState::Stopped);
+        assert_eq!(session.pid, None);
+        assert!(
+            worktree_path.exists(),
+            "hard-limit pauses should preserve worktrees for resume"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_budget_hard_limits_ignores_inactive_sessions() -> Result<()> {
+        let tempdir = TestDir::new("manager-budget-ignore-inactive")?;
+        let mut cfg = build_config(tempdir.path());
+        cfg.token_budget = 100;
+        cfg.cost_budget_usd = 0.0;
+
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "completed-over-budget".to_string(),
+            task: "already done".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: tempdir.path().to_path_buf(),
+            state: SessionState::Completed,
+            pid: None,
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.update_metrics(
+            "completed-over-budget",
+            &SessionMetrics {
+                input_tokens: 90,
+                output_tokens: 30,
+                tokens_used: 120,
+                tool_calls: 0,
+                files_changed: 0,
+                duration_secs: 60,
+                cost_usd: 0.0,
+            },
+        )?;
+
+        let outcome = enforce_budget_hard_limits(&db, &cfg)?;
+        assert!(outcome.token_budget_exceeded);
+        assert!(outcome.paused_sessions.is_empty());
+
+        let session = db
+            .get_session("completed-over-budget")?
+            .context("completed session should still exist")?;
+        assert_eq!(session.state, SessionState::Completed);
+
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_budget_hard_limits_pauses_sessions_over_profile_token_budget() -> Result<()> {
+        let tempdir = TestDir::new("manager-profile-token-budget")?;
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "profile-over-budget".to_string(),
+            task: "review work".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: tempdir.path().to_path_buf(),
+            state: SessionState::Running,
+            pid: Some(999_998),
+            worktree: None,
+            created_at: now - Duration::minutes(1),
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.upsert_session_profile(
+            "profile-over-budget",
+            &SessionAgentProfile {
+                profile_name: "reviewer".to_string(),
+                agent: None,
+                model: Some("sonnet".to_string()),
+                allowed_tools: vec!["Read".to_string()],
+                disallowed_tools: Vec::new(),
+                permission_mode: Some("plan".to_string()),
+                add_dirs: Vec::new(),
+                max_budget_usd: None,
+                token_budget: Some(75),
+                append_system_prompt: None,
+            },
+        )?;
+        db.update_metrics(
+            "profile-over-budget",
+            &SessionMetrics {
+                input_tokens: 60,
+                output_tokens: 30,
+                tokens_used: 90,
+                tool_calls: 0,
+                files_changed: 0,
+                duration_secs: 60,
+                cost_usd: 0.0,
+            },
+        )?;
+
+        let outcome = enforce_budget_hard_limits(&db, &cfg)?;
+        assert!(!outcome.token_budget_exceeded);
+        assert!(!outcome.cost_budget_exceeded);
+        assert!(outcome.profile_token_budget_exceeded);
+        assert_eq!(
+            outcome.paused_sessions,
+            vec!["profile-over-budget".to_string()]
+        );
+
+        let session = db
+            .get_session("profile-over-budget")?
+            .context("session should still exist")?;
+        assert_eq!(session.state, SessionState::Stopped);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_session_requeues_failed_session() -> Result<()> {
+        let tempdir = TestDir::new("manager-resume-session")?;
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "deadbeef".to_string(),
+            task: "resume previous task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: tempdir.path().join("resume-working-dir"),
+            state: SessionState::Failed,
+            pid: Some(31337),
+            worktree: None,
+            created_at: now - Duration::minutes(1),
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        fs::create_dir_all(tempdir.path().join("resume-working-dir"))?;
+        let (fake_claude, log_path) = write_fake_claude(tempdir.path())?;
+
+        let resumed_id =
+            resume_session_with_program(&db, &cfg, "deadbeef", Some(&fake_claude)).await?;
+        let resumed = db
+            .get_session(&resumed_id)?
+            .context("resumed session should exist")?;
+
+        assert_eq!(resumed.state, SessionState::Pending);
+        assert_eq!(resumed.pid, None);
+
+        let log = wait_for_file(&log_path)?;
+        assert!(log.contains("run-session"));
+        assert!(log.contains("--session-id"));
+        assert!(log.contains("deadbeef"));
+        assert!(log.contains("resume previous task"));
+        assert!(log.contains(
+            tempdir
+                .path()
+                .join("resume-working-dir")
+                .to_string_lossy()
+                .as_ref()
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_session_worktree_removes_path_and_clears_metadata() -> Result<()> {
+        let tempdir = TestDir::new("manager-cleanup-worktree")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, _) = write_fake_claude(tempdir.path())?;
+
+        let session_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "cleanup later",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        stop_session_with_options(&db, &session_id, false).await?;
+        let stopped = db
+            .get_session(&session_id)?
+            .context("stopped session should exist")?;
+        let worktree_path = stopped
+            .worktree
+            .clone()
+            .context("stopped session worktree missing")?
+            .path;
+        assert!(
+            worktree_path.exists(),
+            "worktree should still exist before cleanup"
+        );
+
+        cleanup_session_worktree(&db, &session_id).await?;
+
+        let cleaned = db
+            .get_session(&session_id)?
+            .context("cleaned session should still exist")?;
+        assert!(
+            cleaned.worktree.is_none(),
+            "worktree metadata should be cleared"
+        );
+        assert!(!worktree_path.exists(), "worktree path should be removed");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prune_inactive_worktrees_cleans_stopped_sessions_only() -> Result<()> {
+        let tempdir = TestDir::new("manager-prune-worktrees")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, _) = write_fake_claude(tempdir.path())?;
+
+        let active_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "active worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+        let stopped_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "stopped worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        stop_session_with_options(&db, &stopped_id, false).await?;
+
+        let active_before = db
+            .get_session(&active_id)?
+            .context("active session should exist")?;
+        let active_path = active_before
+            .worktree
+            .clone()
+            .context("active session worktree missing")?
+            .path;
+
+        let stopped_before = db
+            .get_session(&stopped_id)?
+            .context("stopped session should exist")?;
+        let stopped_path = stopped_before
+            .worktree
+            .clone()
+            .context("stopped session worktree missing")?
+            .path;
+
+        let outcome = prune_inactive_worktrees(&db, &cfg).await?;
+
+        assert_eq!(outcome.cleaned_session_ids, vec![stopped_id.clone()]);
+        assert_eq!(outcome.active_with_worktree_ids, vec![active_id.clone()]);
+        assert!(outcome.retained_session_ids.is_empty());
+        assert!(active_path.exists(), "active worktree should remain");
+        assert!(!stopped_path.exists(), "stopped worktree should be removed");
+
+        let active_after = db
+            .get_session(&active_id)?
+            .context("active session should still exist")?;
+        assert!(
+            active_after.worktree.is_some(),
+            "active session should keep worktree metadata"
+        );
+
+        let stopped_after = db
+            .get_session(&stopped_id)?
+            .context("stopped session should still exist")?;
+        assert!(
+            stopped_after.worktree.is_none(),
+            "stopped session worktree metadata should be cleared"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prune_inactive_worktrees_defers_recent_sessions_within_retention() -> Result<()> {
+        let tempdir = TestDir::new("manager-prune-worktree-retention")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.worktree_retention_secs = 3600;
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, _) = write_fake_claude(tempdir.path())?;
+
+        let session_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "recently completed worktree",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        stop_session_with_options(&db, &session_id, false).await?;
+
+        let before = db
+            .get_session(&session_id)?
+            .context("retained session should exist")?;
+        let worktree_path = before
+            .worktree
+            .clone()
+            .context("retained session worktree missing")?
+            .path;
+
+        let outcome = prune_inactive_worktrees(&db, &cfg).await?;
+
+        assert!(outcome.cleaned_session_ids.is_empty());
+        assert!(outcome.active_with_worktree_ids.is_empty());
+        assert_eq!(outcome.retained_session_ids, vec![session_id.clone()]);
+        assert!(worktree_path.exists(), "retained worktree should remain");
+        assert!(
+            db.get_session(&session_id)?
+                .context("retained session should still exist")?
+                .worktree
+                .is_some(),
+            "retained session should keep worktree metadata"
+        );
+
+        crate::worktree::remove(
+            &db.get_session(&session_id)?
+                .context("retained session should still exist")?
+                .worktree
+                .context("retained session should still have worktree")?,
+        )?;
+        db.clear_worktree_to_dir(&session_id, &repo_root)?;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_session_worktree_merges_branch_and_cleans_worktree() -> Result<()> {
+        let tempdir = TestDir::new("manager-merge-worktree")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, _) = write_fake_claude(tempdir.path())?;
+
+        let session_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "merge later",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        stop_session_with_options(&db, &session_id, false).await?;
+        let stopped = db
+            .get_session(&session_id)?
+            .context("stopped session should exist")?;
+        let worktree = stopped
+            .worktree
+            .clone()
+            .context("stopped session worktree missing")?;
+
+        fs::write(worktree.path.join("feature.txt"), "ready to merge\n")?;
+        run_git(&worktree.path, ["add", "feature.txt"])?;
+        run_git(&worktree.path, ["commit", "-qm", "feature work"])?;
+
+        let outcome = merge_session_worktree(&db, &session_id, true).await?;
+
+        assert_eq!(outcome.session_id, session_id);
+        assert_eq!(outcome.branch, worktree.branch);
+        assert_eq!(outcome.base_branch, worktree.base_branch);
+        assert!(outcome.cleaned_worktree);
+        assert!(!outcome.already_up_to_date);
+        assert_eq!(
+            fs::read_to_string(repo_root.join("feature.txt"))?,
+            "ready to merge\n"
+        );
+
+        let merged = db
+            .get_session(&outcome.session_id)?
+            .context("merged session should still exist")?;
+        assert!(
+            merged.worktree.is_none(),
+            "worktree metadata should be cleared"
+        );
+        assert!(!worktree.path.exists(), "worktree path should be removed");
+
+        let branch_output = StdCommand::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["branch", "--list", &worktree.branch])
+            .output()?;
+        assert!(
+            String::from_utf8_lossy(&branch_output.stdout)
+                .trim()
+                .is_empty(),
+            "merged worktree branch should be deleted"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_ready_worktrees_merges_ready_sessions_and_skips_active_and_dirty() -> Result<()>
+    {
+        let tempdir = TestDir::new("manager-merge-ready-worktrees")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        let merged_worktree =
+            crate::worktree::create_for_session_in_repo("merge-ready", &cfg, &repo_root)?;
+        fs::write(merged_worktree.path.join("merged.txt"), "bulk merge\n")?;
+        run_git(&merged_worktree.path, ["add", "merged.txt"])?;
+        run_git(&merged_worktree.path, ["commit", "-qm", "merge ready"])?;
+        db.insert_session(&Session {
+            id: "merge-ready".to_string(),
+            task: "merge me".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: merged_worktree.path.clone(),
+            state: SessionState::Completed,
+            pid: None,
+            worktree: Some(merged_worktree.clone()),
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let active_worktree =
+            crate::worktree::create_for_session_in_repo("active-worktree", &cfg, &repo_root)?;
+        db.insert_session(&Session {
+            id: "active-worktree".to_string(),
+            task: "still running".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: active_worktree.path.clone(),
+            state: SessionState::Running,
+            pid: Some(12345),
+            worktree: Some(active_worktree.clone()),
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let dirty_worktree =
+            crate::worktree::create_for_session_in_repo("dirty-worktree", &cfg, &repo_root)?;
+        fs::write(dirty_worktree.path.join("dirty.txt"), "not committed yet\n")?;
+        db.insert_session(&Session {
+            id: "dirty-worktree".to_string(),
+            task: "needs commit".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: dirty_worktree.path.clone(),
+            state: SessionState::Stopped,
+            pid: None,
+            worktree: Some(dirty_worktree.clone()),
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let outcome = merge_ready_worktrees(&db, true).await?;
+
+        assert_eq!(outcome.merged.len(), 1);
+        assert_eq!(outcome.merged[0].session_id, "merge-ready");
+        assert_eq!(
+            outcome.active_with_worktree_ids,
+            vec!["active-worktree".to_string()]
+        );
+        assert_eq!(
+            outcome.dirty_worktree_ids,
+            vec!["dirty-worktree".to_string()]
+        );
+        assert!(outcome.conflicted_session_ids.is_empty());
+        assert!(outcome.failures.is_empty());
+
+        assert_eq!(
+            fs::read_to_string(repo_root.join("merged.txt"))?,
+            "bulk merge\n"
+        );
+        assert!(db
+            .get_session("merge-ready")?
+            .context("merged session should still exist")?
+            .worktree
+            .is_none());
+        assert!(db
+            .get_session("active-worktree")?
+            .context("active session should still exist")?
+            .worktree
+            .is_some());
+        assert!(db
+            .get_session("dirty-worktree")?
+            .context("dirty session should still exist")?
+            .worktree
+            .is_some());
+        assert!(!merged_worktree.path.exists());
+        assert!(active_worktree.path.exists());
+        assert!(dirty_worktree.path.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_merge_queue_rebases_blocked_session_and_merges_it() -> Result<()> {
+        let tempdir = TestDir::new("manager-process-merge-queue-success")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        let alpha_worktree = worktree::create_for_session_in_repo("alpha", &cfg, &repo_root)?;
+        fs::write(alpha_worktree.path.join("README.md"), "hello\nalpha\n")?;
+        run_git(&alpha_worktree.path, ["commit", "-am", "alpha change"])?;
+
+        let beta_worktree = worktree::create_for_session_in_repo("beta", &cfg, &repo_root)?;
+        fs::write(beta_worktree.path.join("README.md"), "hello\nalpha\n")?;
+        run_git(&beta_worktree.path, ["commit", "-am", "beta shared change"])?;
+        fs::write(beta_worktree.path.join("README.md"), "hello\nalpha\nbeta\n")?;
+        run_git(&beta_worktree.path, ["commit", "-am", "beta follow-up"])?;
+
+        db.insert_session(&Session {
+            id: "alpha".to_string(),
+            task: "alpha merge".to_string(),
+            project: "ecc".to_string(),
+            task_group: "merge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: alpha_worktree.path.clone(),
+            state: SessionState::Completed,
+            pid: None,
+            worktree: Some(alpha_worktree.clone()),
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "beta".to_string(),
+            task: "beta merge".to_string(),
+            project: "ecc".to_string(),
+            task_group: "merge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: beta_worktree.path.clone(),
+            state: SessionState::Completed,
+            pid: None,
+            worktree: Some(beta_worktree.clone()),
+            created_at: now - Duration::minutes(1),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let queue_before = build_merge_queue(&db)?;
+        assert_eq!(queue_before.ready_entries.len(), 1);
+        assert_eq!(queue_before.ready_entries[0].session_id, "alpha");
+        assert_eq!(queue_before.blocked_entries.len(), 1);
+        assert_eq!(queue_before.blocked_entries[0].session_id, "beta");
+
+        let outcome = process_merge_queue(&db).await?;
+
+        assert_eq!(
+            outcome
+                .merged
+                .iter()
+                .map(|entry| entry.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(outcome.rebased.len(), 1);
+        assert_eq!(outcome.rebased[0].session_id, "beta");
+        assert!(outcome.active_with_worktree_ids.is_empty());
+        assert!(outcome.conflicted_session_ids.is_empty());
+        assert!(outcome.dirty_worktree_ids.is_empty());
+        assert!(outcome.blocked_by_queue_session_ids.is_empty());
+        assert!(outcome.failures.is_empty());
+        assert_eq!(
+            fs::read_to_string(repo_root.join("README.md"))?,
+            "hello\nalpha\nbeta\n"
+        );
+        assert!(db
+            .get_session("alpha")?
+            .context("alpha should still exist")?
+            .worktree
+            .is_none());
+        assert!(db
+            .get_session("beta")?
+            .context("beta should still exist")?
+            .worktree
+            .is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_merge_queue_records_failed_rebase_and_leaves_blocked_session() -> Result<()> {
+        let tempdir = TestDir::new("manager-process-merge-queue-fail")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        let alpha_worktree = worktree::create_for_session_in_repo("alpha", &cfg, &repo_root)?;
+        fs::write(alpha_worktree.path.join("README.md"), "hello\nalpha\n")?;
+        run_git(&alpha_worktree.path, ["commit", "-am", "alpha change"])?;
+
+        let beta_worktree = worktree::create_for_session_in_repo("beta", &cfg, &repo_root)?;
+        fs::write(beta_worktree.path.join("README.md"), "hello\nbeta\n")?;
+        run_git(&beta_worktree.path, ["commit", "-am", "beta change"])?;
+
+        db.insert_session(&Session {
+            id: "alpha".to_string(),
+            task: "alpha merge".to_string(),
+            project: "ecc".to_string(),
+            task_group: "merge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: alpha_worktree.path.clone(),
+            state: SessionState::Completed,
+            pid: None,
+            worktree: Some(alpha_worktree.clone()),
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "beta".to_string(),
+            task: "beta merge".to_string(),
+            project: "ecc".to_string(),
+            task_group: "merge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: beta_worktree.path.clone(),
+            state: SessionState::Completed,
+            pid: None,
+            worktree: Some(beta_worktree.clone()),
+            created_at: now - Duration::minutes(1),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let outcome = process_merge_queue(&db).await?;
+
+        assert_eq!(
+            outcome
+                .merged
+                .iter()
+                .map(|entry| entry.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha"]
+        );
+        assert!(outcome.rebased.is_empty());
+        assert_eq!(outcome.conflicted_session_ids, vec!["beta".to_string()]);
+        assert!(outcome.active_with_worktree_ids.is_empty());
+        assert!(outcome.dirty_worktree_ids.is_empty());
+        assert!(outcome.blocked_by_queue_session_ids.is_empty());
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].session_id, "beta");
+        assert!(outcome.failures[0].reason.contains("git rebase failed"));
+        assert!(db
+            .get_session("beta")?
+            .context("beta should still exist")?
+            .worktree
+            .is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_merge_queue_orders_ready_sessions_and_blocks_conflicts() -> Result<()> {
+        let tempdir = TestDir::new("manager-merge-queue")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        let alpha_worktree = worktree::create_for_session_in_repo("alpha", &cfg, &repo_root)?;
+        fs::write(alpha_worktree.path.join("README.md"), "alpha\n")?;
+        run_git(&alpha_worktree.path, ["add", "README.md"])?;
+        run_git(&alpha_worktree.path, ["commit", "-m", "alpha change"])?;
+
+        let beta_worktree = worktree::create_for_session_in_repo("beta", &cfg, &repo_root)?;
+        fs::write(beta_worktree.path.join("README.md"), "beta\n")?;
+        run_git(&beta_worktree.path, ["add", "README.md"])?;
+        run_git(&beta_worktree.path, ["commit", "-m", "beta change"])?;
+
+        let gamma_worktree = worktree::create_for_session_in_repo("gamma", &cfg, &repo_root)?;
+        fs::write(gamma_worktree.path.join("src.txt"), "gamma\n")?;
+        run_git(&gamma_worktree.path, ["add", "src.txt"])?;
+        run_git(&gamma_worktree.path, ["commit", "-m", "gamma change"])?;
+
+        db.insert_session(&Session {
+            id: "alpha".to_string(),
+            task: "alpha merge".to_string(),
+            project: "ecc".to_string(),
+            task_group: "merge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: alpha_worktree.path.clone(),
+            state: SessionState::Stopped,
+            pid: None,
+            worktree: Some(alpha_worktree),
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "beta".to_string(),
+            task: "beta merge".to_string(),
+            project: "ecc".to_string(),
+            task_group: "merge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: beta_worktree.path.clone(),
+            state: SessionState::Stopped,
+            pid: None,
+            worktree: Some(beta_worktree),
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "gamma".to_string(),
+            task: "gamma merge".to_string(),
+            project: "ecc".to_string(),
+            task_group: "merge".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: gamma_worktree.path.clone(),
+            state: SessionState::Stopped,
+            pid: None,
+            worktree: Some(gamma_worktree),
+            created_at: now - Duration::minutes(1),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let queue = build_merge_queue(&db)?;
+        assert_eq!(queue.ready_entries.len(), 2);
+        assert_eq!(queue.ready_entries[0].session_id, "alpha");
+        assert_eq!(queue.ready_entries[0].queue_position, Some(1));
+        assert_eq!(queue.ready_entries[1].session_id, "gamma");
+        assert_eq!(queue.ready_entries[1].queue_position, Some(2));
+
+        assert_eq!(queue.blocked_entries.len(), 1);
+        let blocked = &queue.blocked_entries[0];
+        assert_eq!(blocked.session_id, "beta");
+        assert_eq!(blocked.blocked_by.len(), 1);
+        assert_eq!(blocked.blocked_by[0].session_id, "alpha");
+        assert!(blocked.blocked_by[0]
+            .conflicts
+            .contains(&"README.md".to_string()));
+        assert!(blocked.suggested_action.contains("merge after alpha"));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_session_removes_inactive_session_and_worktree() -> Result<()> {
+        let tempdir = TestDir::new("manager-delete-session")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (fake_claude, _) = write_fake_claude(tempdir.path())?;
+
+        let session_id = create_session_in_dir(
+            &db,
+            &cfg,
+            "delete later",
+            "claude",
+            true,
+            &repo_root,
+            &fake_claude,
+        )
+        .await?;
+
+        stop_session_with_options(&db, &session_id, false).await?;
+        let stopped = db
+            .get_session(&session_id)?
+            .context("stopped session should exist")?;
+        let worktree_path = stopped
+            .worktree
+            .clone()
+            .context("stopped session worktree missing")?
+            .path;
+
+        delete_session(&db, &session_id).await?;
+
+        assert!(
+            db.get_session(&session_id)?.is_none(),
+            "session should be deleted"
+        );
+        assert!(!worktree_path.exists(), "worktree path should be removed");
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_status_supports_latest_alias() -> Result<()> {
+        let tempdir = TestDir::new("manager-latest-status")?;
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let older = Utc::now() - Duration::minutes(2);
+        let newer = Utc::now();
+
+        db.insert_session(&build_session("older", SessionState::Running, older))?;
+        db.insert_session(&build_session("newer", SessionState::Idle, newer))?;
+
+        let status = get_status(&db, "latest")?;
+        assert_eq!(status.session.id, "newer");
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_status_surfaces_handoff_lineage() -> Result<()> {
+        let tempdir = TestDir::new("manager-status-lineage")?;
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&build_session(
+            "parent",
+            SessionState::Running,
+            now - Duration::minutes(2),
+        ))?;
+        db.insert_session(&build_session(
+            "child",
+            SessionState::Pending,
+            now - Duration::minutes(1),
+        ))?;
+        db.insert_session(&build_session("sibling", SessionState::Idle, now))?;
+
+        db.send_message(
+            "parent",
+            "child",
+            "{\"task\":\"Review auth flow\",\"context\":\"Delegated from parent\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "parent",
+            "sibling",
+            "{\"task\":\"Check billing\",\"context\":\"Delegated from parent\"}",
+            "task_handoff",
+        )?;
+
+        let status = get_status(&db, "parent")?;
+        let rendered = status.to_string();
+
+        assert!(rendered.contains("Children:"));
+        assert!(rendered.contains("child"));
+        assert!(rendered.contains("sibling"));
+
+        let child_status = get_status(&db, "child")?;
+        assert_eq!(child_status.parent_session.as_deref(), Some("parent"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_team_status_groups_delegated_children() -> Result<()> {
+        let tempdir = TestDir::new("manager-team-status")?;
+        let _cfg = build_config(tempdir.path());
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&build_session(
+            "lead",
+            SessionState::Running,
+            now - Duration::minutes(3),
+        ))?;
+        db.insert_session(&build_session(
+            "worker-a",
+            SessionState::Running,
+            now - Duration::minutes(2),
+        ))?;
+        db.insert_session(&build_session(
+            "worker-b",
+            SessionState::Pending,
+            now - Duration::minutes(1),
+        ))?;
+        db.insert_session(&build_session("reviewer", SessionState::Completed, now))?;
+
+        db.send_message(
+            "lead",
+            "worker-a",
+            "{\"task\":\"Implement auth\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "lead",
+            "worker-b",
+            "{\"task\":\"Check billing\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "worker-a",
+            "reviewer",
+            "{\"task\":\"Review auth\",\"context\":\"Delegated from worker-a\"}",
+            "task_handoff",
+        )?;
+
+        let team = get_team_status(&db, "lead", 2)?;
+        let rendered = team.to_string();
+
+        assert!(rendered.contains("Lead:    lead [running]"));
+        assert!(rendered.contains("Running:"));
+        assert!(rendered.contains("Pending:"));
+        assert!(rendered.contains("Completed:"));
+        assert!(rendered.contains("worker-a"));
+        assert!(rendered.contains("worker-b"));
+        assert!(rendered.contains("reviewer"));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_session_reuses_idle_delegate_when_available() -> Result<()> {
+        let tempdir = TestDir::new("manager-assign-reuse-idle")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "idle-worker".to_string(),
+            task: "old worker task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: Some(99),
+            worktree: None,
+            created_at: now - Duration::minutes(1),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "idle-worker",
+            "{\"task\":\"old worker task\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.mark_messages_read("idle-worker")?;
+
+        let (fake_runner, _) = write_fake_claude(tempdir.path())?;
+        let outcome = assign_session_in_dir_with_runner_program(
+            &db,
+            &cfg,
+            "lead",
+            "Review billing edge cases",
+            "claude",
+            true,
+            &repo_root,
+            &fake_runner,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        assert_eq!(outcome.session_id, "idle-worker");
+        assert_eq!(outcome.action, AssignmentAction::ReusedIdle);
+
+        let messages = db.list_messages_for_session("idle-worker", 10)?;
+        assert!(messages.iter().any(|message| {
+            message.msg_type == "task_handoff"
+                && message.content.contains("Review billing edge cases")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_session_spawns_instead_of_reusing_backed_up_idle_delegate() -> Result<()> {
+        let tempdir = TestDir::new("manager-assign-spawn-backed-up-idle")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "idle-worker".to_string(),
+            task: "old worker task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: Some(99),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "idle-worker",
+            "{\"task\":\"old worker task\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+
+        let (fake_runner, _) = write_fake_claude(tempdir.path())?;
+        let outcome = assign_session_in_dir_with_runner_program(
+            &db,
+            &cfg,
+            "lead",
+            "Fresh delegated task",
+            "claude",
+            true,
+            &repo_root,
+            &fake_runner,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        assert_eq!(outcome.action, AssignmentAction::Spawned);
+        assert_ne!(outcome.session_id, "idle-worker");
+
+        let idle_messages = db.list_messages_for_session("idle-worker", 10)?;
+        let fresh_assignments = idle_messages
+            .iter()
+            .filter(|message| {
+                message.msg_type == "task_handoff"
+                    && message.content.contains("Fresh delegated task")
+            })
+            .count();
+        assert_eq!(fresh_assignments, 0);
+
+        let spawned_messages = db.list_messages_for_session(&outcome.session_id, 10)?;
+        assert!(spawned_messages.iter().any(|message| {
+            message.msg_type == "task_handoff" && message.content.contains("Fresh delegated task")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_session_reuses_idle_delegate_when_only_non_handoff_messages_are_unread(
+    ) -> Result<()> {
+        let tempdir = TestDir::new("manager-assign-reuse-idle-info-inbox")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "idle-worker".to_string(),
+            task: "old worker task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: Some(99),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "idle-worker",
+            "{\"task\":\"old worker task\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.mark_messages_read("idle-worker")?;
+        db.send_message("lead", "idle-worker", "FYI status update", "info")?;
+
+        let (fake_runner, _) = write_fake_claude(tempdir.path())?;
+        let outcome = assign_session_in_dir_with_runner_program(
+            &db,
+            &cfg,
+            "lead",
+            "Fresh delegated task",
+            "claude",
+            true,
+            &repo_root,
+            &fake_runner,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        assert_eq!(outcome.action, AssignmentAction::ReusedIdle);
+        assert_eq!(outcome.session_id, "idle-worker");
+
+        let idle_messages = db.list_messages_for_session("idle-worker", 10)?;
+        assert!(idle_messages.iter().any(|message| {
+            message.msg_type == "task_handoff" && message.content.contains("Fresh delegated task")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_session_spawns_when_team_has_capacity() -> Result<()> {
+        let tempdir = TestDir::new("manager-assign-spawn")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "busy-worker".to_string(),
+            task: "existing work".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(55),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "busy-worker",
+            "{\"task\":\"existing work\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+
+        let (fake_runner, _) = write_fake_claude(tempdir.path())?;
+        let outcome = assign_session_in_dir_with_runner_program(
+            &db,
+            &cfg,
+            "lead",
+            "New delegated task",
+            "claude",
+            true,
+            &repo_root,
+            &fake_runner,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        assert_eq!(outcome.action, AssignmentAction::Spawned);
+        assert_ne!(outcome.session_id, "busy-worker");
+
+        let spawned = db
+            .get_session(&outcome.session_id)?
+            .context("spawned delegated session missing")?;
+        assert_eq!(spawned.state, SessionState::Pending);
+
+        let messages = db.list_messages_for_session(&outcome.session_id, 10)?;
+        assert!(messages.iter().any(|message| {
+            message.msg_type == "task_handoff" && message.content.contains("New delegated task")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_session_inherits_lead_grouping_for_spawned_delegate() -> Result<()> {
+        let tempdir = TestDir::new("manager-assign-grouping-inheritance")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "ecc-platform".to_string(),
+            task_group: "checkout recovery".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let (fake_runner, _) = write_fake_claude(tempdir.path())?;
+        let outcome = assign_session_in_dir_with_runner_program(
+            &db,
+            &cfg,
+            "lead",
+            "investigate webhook retry edge cases",
+            "claude",
+            true,
+            &repo_root,
+            &fake_runner,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        assert_eq!(outcome.action, AssignmentAction::Spawned);
+
+        let spawned = db
+            .get_session(&outcome.session_id)?
+            .context("spawned delegated session missing")?;
+        assert_eq!(spawned.project, "ecc-platform");
+        assert_eq!(spawned.task_group, "checkout recovery");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_session_defers_when_team_is_saturated() -> Result<()> {
+        let tempdir = TestDir::new("manager-assign-defer-saturated")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.max_parallel_sessions = 1;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "busy-worker".to_string(),
+            task: "existing work".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(55),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "busy-worker",
+            "{\"task\":\"existing work\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+
+        let (fake_runner, _) = write_fake_claude(tempdir.path())?;
+        let outcome = assign_session_in_dir_with_runner_program(
+            &db,
+            &cfg,
+            "lead",
+            "New delegated task",
+            "claude",
+            true,
+            &repo_root,
+            &fake_runner,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        assert_eq!(outcome.action, AssignmentAction::DeferredSaturated);
+        assert_eq!(outcome.session_id, "lead");
+
+        let busy_messages = db.list_messages_for_session("busy-worker", 10)?;
+        assert!(!busy_messages.iter().any(|message| {
+            message.msg_type == "task_handoff" && message.content.contains("New delegated task")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_inbox_routes_unread_task_handoffs_and_marks_them_read() -> Result<()> {
+        let tempdir = TestDir::new("manager-drain-inbox")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.send_message(
+            "planner",
+            "lead",
+            "{\"task\":\"Review auth changes\",\"context\":\"Inbound request\"}",
+            "task_handoff",
+        )?;
+
+        let outcomes = drain_inbox(&db, &cfg, "lead", "claude", true, 5).await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].task, "Review auth changes");
+        assert_eq!(outcomes[0].action, AssignmentAction::Spawned);
+
+        let unread = db.unread_message_counts()?;
+        assert_eq!(unread.get("lead"), None);
+
+        let messages = db.list_messages_for_session(&outcomes[0].session_id, 10)?;
+        assert!(messages.iter().any(|message| {
+            message.msg_type == "task_handoff" && message.content.contains("Review auth changes")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_inbox_leaves_saturated_handoffs_unread() -> Result<()> {
+        let tempdir = TestDir::new("manager-drain-inbox-defer")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.max_parallel_sessions = 1;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "busy-worker".to_string(),
+            task: "existing work".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(55),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "busy-worker",
+            "{\"task\":\"existing work\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "planner",
+            "lead",
+            "{\"task\":\"Review auth changes\",\"context\":\"Inbound request\"}",
+            "task_handoff",
+        )?;
+
+        let outcomes = drain_inbox(&db, &cfg, "lead", "claude", true, 5).await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].task, "Review auth changes");
+        assert_eq!(outcomes[0].action, AssignmentAction::DeferredSaturated);
+        assert_eq!(outcomes[0].session_id, "lead");
+
+        let unread = db.unread_message_counts()?;
+        assert_eq!(unread.get("lead"), Some(&1));
+        assert_eq!(unread.get("busy-worker"), Some(&1));
+
+        let messages = db.list_messages_for_session("busy-worker", 10)?;
+        assert!(!messages.iter().any(|message| {
+            message.msg_type == "task_handoff" && message.content.contains("Review auth changes")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_dispatch_backlog_routes_multiple_lead_inboxes() -> Result<()> {
+        let tempdir = TestDir::new("manager-auto-dispatch")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.auto_dispatch_limit_per_session = 5;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        for lead_id in ["lead-a", "lead-b"] {
+            db.insert_session(&Session {
+                id: lead_id.to_string(),
+                task: format!("{lead_id} task"),
+                project: "workspace".to_string(),
+                task_group: "general".to_string(),
+                agent_type: "claude".to_string(),
+                working_dir: repo_root.clone(),
+                state: SessionState::Running,
+                pid: Some(42),
+                worktree: None,
+                created_at: now - Duration::minutes(3),
+                updated_at: now - Duration::minutes(3),
+                last_heartbeat_at: now - Duration::minutes(3),
+                metrics: SessionMetrics::default(),
+            })?;
+        }
+
+        db.send_message(
+            "planner",
+            "lead-a",
+            "{\"task\":\"Review auth\",\"context\":\"Inbound\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "planner",
+            "lead-b",
+            "{\"task\":\"Review billing\",\"context\":\"Inbound\"}",
+            "task_handoff",
+        )?;
+
+        let outcomes = auto_dispatch_backlog(&db, &cfg, "claude", true, 10).await?;
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().any(|outcome| {
+            outcome.lead_session_id == "lead-a"
+                && outcome.unread_count == 1
+                && outcome.routed.len() == 1
+        }));
+        assert!(outcomes.iter().any(|outcome| {
+            outcome.lead_session_id == "lead-b"
+                && outcome.unread_count == 1
+                && outcome.routed.len() == 1
+        }));
+
+        let unread = db.unread_task_handoff_targets(10)?;
+        assert!(!unread.iter().any(|(session_id, _)| session_id == "lead-a"));
+        assert!(!unread.iter().any(|(session_id, _)| session_id == "lead-b"));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinate_backlog_reports_remaining_backlog_after_limited_pass() -> Result<()> {
+        let tempdir = TestDir::new("manager-coordinate-backlog")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.auto_dispatch_limit_per_session = 5;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        for lead_id in ["lead-a", "lead-b"] {
+            db.insert_session(&Session {
+                id: lead_id.to_string(),
+                task: format!("{lead_id} task"),
+                project: "workspace".to_string(),
+                task_group: "general".to_string(),
+                agent_type: "claude".to_string(),
+                working_dir: repo_root.clone(),
+                state: SessionState::Running,
+                pid: Some(42),
+                worktree: None,
+                created_at: now - Duration::minutes(3),
+                updated_at: now - Duration::minutes(3),
+                last_heartbeat_at: now - Duration::minutes(3),
+                metrics: SessionMetrics::default(),
+            })?;
+        }
+
+        db.send_message(
+            "planner",
+            "lead-a",
+            "{\"task\":\"Review auth\",\"context\":\"Inbound\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "planner",
+            "lead-b",
+            "{\"task\":\"Review billing\",\"context\":\"Inbound\"}",
+            "task_handoff",
+        )?;
+
+        let outcome = coordinate_backlog(&db, &cfg, "claude", true, 1).await?;
+
+        assert_eq!(outcome.dispatched.len(), 1);
+        assert_eq!(outcome.rebalanced.len(), 0);
+        assert_eq!(outcome.remaining_backlog_sessions, 2);
+        assert_eq!(outcome.remaining_backlog_messages, 2);
+        assert_eq!(outcome.remaining_absorbable_sessions, 2);
+        assert_eq!(outcome.remaining_saturated_sessions, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinate_backlog_classifies_remaining_saturated_pressure() -> Result<()> {
+        let tempdir = TestDir::new("manager-coordinate-saturated")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.max_parallel_sessions = 1;
+        cfg.auto_dispatch_limit_per_session = 1;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "worker".to_string(),
+            task: "worker task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.insert_session(&Session {
+            id: "worker-child".to_string(),
+            task: "delegate task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(43),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.send_message(
+            "worker",
+            "worker-child",
+            "{\"task\":\"seed delegate\",\"context\":\"Delegated from worker\"}",
+            "task_handoff",
+        )?;
+        let _ = db.mark_messages_read("worker-child")?;
+
+        db.send_message(
+            "planner",
+            "worker",
+            "{\"task\":\"task-a\",\"context\":\"Inbound\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "planner",
+            "worker",
+            "{\"task\":\"task-b\",\"context\":\"Inbound\"}",
+            "task_handoff",
+        )?;
+
+        let outcome = coordinate_backlog(&db, &cfg, "claude", true, 10).await?;
+
+        assert_eq!(outcome.remaining_backlog_sessions, 1);
+        assert_eq!(outcome.remaining_backlog_messages, 2);
+        assert_eq!(outcome.remaining_absorbable_sessions, 0);
+        assert_eq!(outcome.remaining_saturated_sessions, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebalance_team_backlog_moves_work_off_backed_up_delegate() -> Result<()> {
+        let tempdir = TestDir::new("manager-rebalance-team")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.max_parallel_sessions = 2;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(4),
+            updated_at: now - Duration::minutes(4),
+            last_heartbeat_at: now - Duration::minutes(4),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "worker-a".to_string(),
+            task: "auth lane".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: None,
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "worker-b".to_string(),
+            task: "billing lane".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: None,
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.send_message(
+            "lead",
+            "worker-a",
+            "{\"task\":\"Review auth flow\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "lead",
+            "worker-a",
+            "{\"task\":\"Check billing integration\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "lead",
+            "worker-b",
+            "{\"task\":\"Existing clear lane\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        let _ = db.mark_messages_read("worker-b")?;
+
+        let outcomes = rebalance_team_backlog(&db, &cfg, "lead", "claude", true, 5).await?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].from_session_id, "worker-a");
+        assert_eq!(outcomes[0].session_id, "worker-b");
+        assert_eq!(outcomes[0].action, AssignmentAction::ReusedIdle);
+
+        let unread = db.unread_message_counts()?;
+        assert_eq!(unread.get("worker-a"), Some(&1));
+        assert_eq!(unread.get("worker-b"), Some(&1));
+
+        let worker_b_messages = db.list_messages_for_session("worker-b", 10)?;
+        assert!(worker_b_messages.iter().any(|message| {
+            message.msg_type == "task_handoff" && message.content.contains("Review auth flow")
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn team_status_reports_handoff_backlog_not_generic_inbox_noise() -> Result<()> {
+        let tempdir = TestDir::new("manager-team-status-backlog")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(4),
+            updated_at: now - Duration::minutes(4),
+            last_heartbeat_at: now - Duration::minutes(4),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "worker".to_string(),
+            task: "delegate task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root,
+            state: SessionState::Idle,
+            pid: None,
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.send_message("lead", "worker", "FYI status update", "info")?;
+        db.send_message(
+            "lead",
+            "worker",
+            "{\"task\":\"Delegated work\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        let _ = db.mark_messages_read("worker")?;
+        db.send_message("lead", "worker", "FYI reminder", "info")?;
+
+        let status = get_team_status(&db, "lead", 3)?;
+        let rendered = format!("{status}");
+
+        assert!(rendered.contains("Backlog: 0"));
+        assert!(rendered.contains("| backlog 0 handoff(s) |"));
+        assert!(!rendered.contains("Inbox:"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn coordination_status_display_surfaces_mode_and_activity() {
+        let status = CoordinationStatus {
+            backlog_leads: 2,
+            backlog_messages: 5,
+            absorbable_sessions: 1,
+            saturated_sessions: 1,
+            mode: CoordinationMode::RebalanceFirstChronicSaturation,
+            health: CoordinationHealth::Saturated,
+            operator_escalation_required: false,
+            auto_dispatch_enabled: true,
+            auto_dispatch_limit_per_session: 4,
+            daemon_activity: build_daemon_activity(),
+        };
+
+        let rendered = status.to_string();
+        assert!(rendered.contains(
+            "Global handoff backlog: 2 lead(s) / 5 handoff(s) [1 absorbable, 1 saturated]"
+        ));
+        assert!(rendered.contains("Auto-dispatch: on @ 4/lead"));
+        assert!(rendered.contains("Coordination mode: rebalance-first (chronic saturation)"));
+        assert!(rendered.contains("Chronic saturation streak: 2 cycle(s)"));
+        assert!(rendered.contains("Last daemon dispatch: 3 routed / 1 deferred across 2 lead(s)"));
+        assert!(rendered.contains("Last daemon recovery dispatch: 2 handoff(s) across 1 lead(s)"));
+        assert!(rendered.contains("Last daemon rebalance: 0 handoff(s) across 1 lead(s)"));
+        assert!(rendered.contains(
+            "Last daemon auto-merge: 1 merged / 1 active / 0 conflicted / 0 dirty / 0 failed"
+        ));
+        assert!(rendered.contains("Last daemon auto-prune: 2 pruned / 1 active"));
+    }
+
+    #[test]
+    fn coordination_status_summarizes_real_handoff_backlog() -> Result<()> {
+        let tempdir = TestDir::new("manager-coordination-status")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = Config {
+            max_parallel_sessions: 1,
+            ..build_config(tempdir.path())
+        };
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&build_session("source", SessionState::Running, now))?;
+        db.insert_session(&build_session("lead-a", SessionState::Running, now))?;
+        db.insert_session(&build_session("lead-b", SessionState::Running, now))?;
+        db.insert_session(&build_session(
+            "delegate-b",
+            SessionState::Idle,
+            now - Duration::seconds(1),
+        ))?;
+
+        db.send_message(
+            "source",
+            "lead-a",
+            "{\"task\":\"clear docs\",\"context\":\"incoming\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "source",
+            "lead-b",
+            "{\"task\":\"review queue\",\"context\":\"incoming\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "lead-b",
+            "delegate-b",
+            "{\"task\":\"delegate queue\",\"context\":\"routed\"}",
+            "task_handoff",
+        )?;
+
+        db.record_daemon_dispatch_pass(1, 1, 2)?;
+
+        let status = get_coordination_status(&db, &cfg)?;
+        assert_eq!(status.backlog_leads, 3);
+        assert_eq!(status.backlog_messages, 3);
+        assert_eq!(status.absorbable_sessions, 2);
+        assert_eq!(status.saturated_sessions, 1);
+        assert_eq!(
+            status.mode,
+            CoordinationMode::RebalanceFirstChronicSaturation
+        );
+        assert_eq!(status.health, CoordinationHealth::Saturated);
+        assert!(!status.operator_escalation_required);
+        assert_eq!(status.daemon_activity.last_dispatch_routed, 1);
+        assert_eq!(status.daemon_activity.last_dispatch_deferred, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_conflict_resolution_pauses_later_session_and_notifies_lead() -> Result<()> {
+        let tempdir = TestDir::new("manager-conflict-escalate")?;
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&build_session("lead", SessionState::Running, now))?;
+        db.insert_session(&build_session(
+            "session-a",
+            SessionState::Running,
+            now - Duration::minutes(2),
+        ))?;
+        db.insert_session(&build_session(
+            "session-b",
+            SessionState::Running,
+            now - Duration::minutes(1),
+        ))?;
+
+        crate::comms::send(
+            &db,
+            "lead",
+            "session-b",
+            &crate::comms::MessageType::TaskHandoff {
+                task: "Review src/lib.rs".to_string(),
+                context: "Lead delegated follow-up".to_string(),
+            },
+        )?;
+
+        let metrics_dir = tempdir.path().join("metrics");
+        std::fs::create_dir_all(&metrics_dir)?;
+        let metrics_path = metrics_dir.join("tool-usage.jsonl");
+        std::fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"session-a\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/lib.rs\",\"output_summary\":\"updated logic\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:02:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"session-b\",\"tool_name\":\"Write\",\"input_summary\":\"Write src/lib.rs\",\"output_summary\":\"newer change\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:03:00Z\"}\n"
+            ),
+        )?;
+        db.sync_tool_activity_metrics(&metrics_path)?;
+
+        let outcome = enforce_conflict_resolution(&db, &cfg)?;
+        assert_eq!(outcome.created_incidents, 1);
+        assert_eq!(outcome.resolved_incidents, 0);
+        assert_eq!(outcome.paused_sessions, vec!["session-b".to_string()]);
+
+        let session_a = db
+            .get_session("session-a")?
+            .expect("session-a should still exist");
+        let session_b = db
+            .get_session("session-b")?
+            .expect("session-b should still exist");
+        assert_eq!(session_a.state, SessionState::Running);
+        assert_eq!(session_b.state, SessionState::Stopped);
+
+        assert!(db.has_open_conflict_incident("src/lib.rs::session-a::session-b")?);
+
+        let decisions = db.list_decisions_for_session("session-b", 10)?;
+        assert!(decisions
+            .iter()
+            .any(|entry| entry.decision == "Pause work due to conflict on src/lib.rs"));
+
+        let approval_counts = db.unread_approval_counts()?;
+        assert_eq!(approval_counts.get("session-b"), Some(&1usize));
+        assert_eq!(approval_counts.get("lead"), Some(&1usize));
+
+        let unread_queue = db.unread_approval_queue(10)?;
+        assert!(unread_queue.iter().any(|msg| {
+            msg.to_session == "session-b"
+                && msg.msg_type == "conflict"
+                && msg.content.contains("src/lib.rs")
+        }));
+        assert!(unread_queue.iter().any(|msg| {
+            msg.to_session == "lead"
+                && msg.msg_type == "conflict"
+                && msg.content.contains("delegate session-b paused")
+        }));
+
+        let second_pass = enforce_conflict_resolution(&db, &cfg)?;
+        assert_eq!(second_pass.created_incidents, 0);
+        assert_eq!(second_pass.paused_sessions, Vec::<String>::new());
+        assert_eq!(
+            db.list_open_conflict_incidents_for_session("session-b", 10)?
+                .len(),
+            1
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn enforce_conflict_resolution_supports_last_write_wins() -> Result<()> {
+        let tempdir = TestDir::new("manager-conflict-last-write-wins")?;
+        let mut cfg = build_config(tempdir.path());
+        cfg.conflict_resolution.strategy = crate::config::ConflictResolutionStrategy::LastWriteWins;
+        cfg.conflict_resolution.notify_lead = false;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&build_session(
+            "session-a",
+            SessionState::Running,
+            now - Duration::minutes(2),
+        ))?;
+        db.insert_session(&build_session(
+            "session-b",
+            SessionState::Running,
+            now - Duration::minutes(1),
+        ))?;
+
+        let metrics_dir = tempdir.path().join("metrics");
+        std::fs::create_dir_all(&metrics_dir)?;
+        let metrics_path = metrics_dir.join("tool-usage.jsonl");
+        std::fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"session-a\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/lib.rs\",\"output_summary\":\"older change\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:02:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"session-b\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/lib.rs\",\"output_summary\":\"later change\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:03:00Z\"}\n"
+            ),
+        )?;
+        db.sync_tool_activity_metrics(&metrics_path)?;
+
+        let outcome = enforce_conflict_resolution(&db, &cfg)?;
+        assert_eq!(outcome.created_incidents, 1);
+        assert_eq!(outcome.paused_sessions, vec!["session-a".to_string()]);
+
+        let session_a = db
+            .get_session("session-a")?
+            .expect("session-a should still exist");
+        let session_b = db
+            .get_session("session-b")?
+            .expect("session-b should still exist");
+        assert_eq!(session_a.state, SessionState::Stopped);
+        assert_eq!(session_b.state, SessionState::Running);
+
+        let incidents = db.list_open_conflict_incidents_for_session("session-a", 10)?;
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].active_session_id, "session-b");
+        assert_eq!(incidents[0].paused_session_id, "session-a");
+        assert_eq!(incidents[0].strategy, "last_write_wins");
+
+        Ok(())
+    }
+}
