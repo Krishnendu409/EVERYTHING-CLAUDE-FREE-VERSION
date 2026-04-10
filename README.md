@@ -1,102 +1,110 @@
-# EVERYTHING-CLAUDE-FREE-VERSION
+# ECC — Free Version
 
-A free AI coding assistant setup using **Gemma 4 27B** (via Google AI Studio) as the primary model, with **Qwen 2.5 Coder 7B** (via Ollama, local) as the fallback when the free quota runs out.
+> The full **Everything Claude Code** project ([affaan-m/everything-claude-code](https://github.com/affaan-m/everything-claude-code)) — all agents, skills, hooks, rules, and commands — pre-wired for **free models** instead of paid Claude APIs.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
 ## Models
 
-| | Gemma 4 27B (Primary) | Qwen 2.5 Coder 7B (Fallback) |
-|---|---|---|
-| Provider | Google AI Studio (cloud) | Ollama (local) |
-| Cost | Free — 1,500 req/day | Free forever |
-| Context window | 128K tokens | 32K tokens |
-| Code quality | Excellent | Good |
-| Speed | Fast (cloud GPU) | ~5–15 tok/s on CPU |
-| Privacy | Google sees your code | 100% local |
-| Works offline | No | Yes |
+| Role | Model | Provider | Cost |
+|------|-------|----------|------|
+| Primary / large tasks | **Gemma 4 27B** (`google/gemma-4-27b-it`) | Google AI Studio | Free (rate-limited) |
+| Fast / small tasks | **Qwen 2.5 Coder 7B** (`ollama/qwen2.5-coder:7b`) | Ollama (local) | Free (local GPU/CPU) |
 
 ---
 
-## Prerequisites
+## Quick Setup
 
-- [Node.js](https://nodejs.org) ≥ 18
-- [OpenCode](https://github.com/sst/opencode) (`npm i -g opencode`)
-- A free [Google AI Studio](https://aistudio.google.com) API key
-- [Ollama](https://ollama.com) (for the local fallback)
+### 1. Get a Google AI Studio key
+Go to <https://aistudio.google.com> → Get API key → copy it.
 
----
-
-## Setup
-
-### 1. Get your free Google AI Studio API key
-
-1. Go to [aistudio.google.com](https://aistudio.google.com) and sign in with a Google account.
-2. Click **"Get API key"** → **"Create API key"**.
-3. Copy the key — you'll need it in the next step.
-
-Free tier limits: **1,500 requests/day**, **1,000,000 tokens/minute**.
-
-### 2. Configure OpenCode
-
-Copy the template and fill in your key:
-
+### 2. Export the key
 ```bash
-mkdir -p ~/.config/opencode
-cp opencode.json ~/.config/opencode/config.json
+export GOOGLE_AI_STUDIO_KEY=your_key_here
 ```
+Or copy `.env.example` to `.env` and fill it in (requires your shell to source it).
 
-Then open `~/.config/opencode/config.json` and replace `YOUR_AI_STUDIO_KEY` with your real key.
-
-### 3. Install the Ollama fallback
-
+### 3. Install Ollama + pull the local model
 ```bash
 bash scripts/setup-ollama.sh
 ```
+This installs Ollama if needed and pulls `qwen2.5-coder:7b` (~4.7 GB).
 
-This installs Ollama and pulls the `qwen2.5-coder:7b` model (~4.7 GB). Requires ~7 GB of RAM.
+### 4. Install OpenCode
+```bash
+npm i -g opencode
+```
 
-### 4. Start coding
-
+### 5. Run
 ```bash
 opencode
 ```
 
 ---
 
-## Switching Between Models
+## Switching Models
 
-**Primary (Gemma 4 27B — cloud):**
+Edit `.opencode/opencode.json` — change the top-level `"model"` field:
 
-```bash
-# In ~/.config/opencode/config.json, set:
+```jsonc
+// Use Gemma (default — needs GOOGLE_AI_STUDIO_KEY):
 "model": "google/gemma-4-27b-it"
-```
 
-**Fallback (Qwen 2.5 Coder 7B — local):**
-
-```bash
-# In ~/.config/opencode/config.json, set:
+// Switch to fully-local Qwen when quota is exceeded:
 "model": "ollama/qwen2.5-coder:7b"
 ```
 
-Only one line changes — all skills, rules, and hooks stay the same.
+---
 
-### Check your AI Studio quota
-
+## Check Your Quota
 ```bash
 bash scripts/check-quota.sh
 ```
 
-AI Studio quota resets daily at **midnight Pacific Time**.
+---
+
+## What's Included
+
+Everything from the upstream ECC project, unchanged:
+
+| Directory | Contents |
+|-----------|----------|
+| `.opencode/` | OpenCode configuration (agents, commands, plugins) |
+| `skills/` | 180+ reusable skill modules |
+| `agents/` | Agent definitions |
+| `rules/` | Coding rules and guidelines |
+| `hooks/` | Lifecycle hooks |
+| `commands/` | Slash-command templates |
+| `contexts/` | Context files |
+| `scripts/` | Setup and utility scripts |
+| `.claude/` | Claude Code compatibility shims |
+| `.cursor/` | Cursor IDE integration |
+| `.kiro/` | Kiro IDE integration |
+| `.gemini/` | Gemini CLI integration |
+| `.agents/` | Multi-agent configs |
 
 ---
 
-## Files
+## Project Structure
 
 ```
-opencode.json               OpenCode config template (copy to ~/.config/opencode/config.json)
-scripts/
-  setup-ollama.sh           Installs Ollama and pulls qwen2.5-coder:7b
-  check-quota.sh            Checks remaining Google AI Studio free quota
+.opencode/opencode.json   ← main config (model set to Gemma/Qwen)
+scripts/setup-ollama.sh   ← install Ollama + pull qwen2.5-coder:7b
+scripts/check-quota.sh    ← verify Google AI Studio quota
+.env.example              ← copy to .env, fill GOOGLE_AI_STUDIO_KEY
 ```
+
+---
+
+## Credits
+
+Original project: **[affaan-m/everything-claude-code](https://github.com/affaan-m/everything-claude-code)** by [@affaan-m](https://github.com/affaan-m).  
+This repo substitutes the paid Anthropic/Claude models for free alternatives while keeping all agent logic, skills, rules, hooks, and commands intact.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
