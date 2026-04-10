@@ -67,12 +67,26 @@ bash scripts/check-quota.sh
 
 ## What's Included
 
-Everything from the upstream ECC project, unchanged:
+Access to 47 agents, 181 skills, and 79 legacy command shims — everything from the upstream ECC project, unchanged:
+
+| Feature | Claude Code | Cursor IDE | Codex CLI | OpenCode |
+|---------|------------|------------|-----------|----------|
+| Agents | ✅ 47 agents | Shared | Shared | 1 |
+| Commands | ✅ 79 commands | Shared | Shared | 1 |
+| Skills | ✅ 181 skills | Shared | Shared | 1 |
+
+## Cross-Tool Feature Parity
+
+| Feature | Claude Code | Cursor IDE | Codex CLI | OpenCode |
+|---------|------------|------------|-----------|----------|
+| **Agents** | 47 | Shared (AGENTS.md) | Shared (AGENTS.md) | 12 |
+| **Commands** | 79 | Shared | Instruction-based | 31 |
+| **Skills** | 181 | Shared | 10 (native format) | 37 |
 
 | Directory | Contents |
 |-----------|----------|
 | `.opencode/` | OpenCode configuration (agents, commands, plugins) |
-| `skills/` | 180+ reusable skill modules |
+| `skills/` | 181 reusable skill modules |
 | `agents/` | Agent definitions |
 | `rules/` | Coding rules and guidelines |
 | `hooks/` | Lifecycle hooks |
