@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.schema.json",
+  "model": "google/gemma-4-27b-it",
+  "providers": {
+    "google": {
+      "apiKey": "YOUR_AI_STUDIO_KEY",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai"
+    },
+    "ollama": {
+      "baseUrl": "http://localhost:11434"
+    }
+  }
+}
